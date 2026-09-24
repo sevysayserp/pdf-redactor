@@ -1,0 +1,24 @@
+# Real documents must never enter this repo. Everything a redaction run
+# touches is ignored by default; the FAKE set in testdata/ is re-included.
+*.pdf
+*.csv
+*.xlsx
+redacted/
+# sensitive wherever it lives (CLAUDE.md rule 4)
+redaction_list.txt
+
+!testdata/
+!testdata/**
+# ...but not redaction output written into testdata/ by a local run
+testdata/redacted/
+
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# WSL/NTFS alternate-data-stream artifacts
+*:Zone.Identifier

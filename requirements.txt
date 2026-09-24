@@ -1,0 +1,9 @@
+# Runtime
+pdfplumber==0.11.10
+pypdfium2==5.13.0
+pillow==12.3.0
+rapidocr-onnxruntime==1.4.4
+pymupdf==1.28.2
+# Tests and fixture generator
+pytest==9.1.1
+reportlab==5.0.1

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-redactor"
+version = "0.1.0"
+description = "Preview-first redaction of personal data out of PDFs: token-stable text extracts, true-redacted PDFs, OCR for scans, and a value-free leak audit."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pdfplumber>=0.11",
+    "pypdfium2>=4",
+    "pillow>=10",
+    "rapidocr-onnxruntime>=1.4",
+    "pymupdf>=1.24",
+]
+
+[project.scripts]
+pdf-redact = "redact:main"
+
+[tool.setuptools]
+py-modules = ["redact"]

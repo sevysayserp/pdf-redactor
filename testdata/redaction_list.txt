@@ -1,0 +1,16 @@
+# Fake redaction list for testdata/ — every entry here is fabricated.
+# Format: one entry per line, optional category prefix
+#   name: / addr: / acct: / employer:   (unprefixed lines default to name)
+# Matching is case-insensitive with collapsed whitespace.
+
+name: JOHN A SAMPLE
+name: JANE B SAMPLE
+employer: ACME WIDGETS INC
+employer: FIRST EXAMPLE BANK
+employer: SECOND NATIONAL BANK
+employer: EXAMPLE BROKERAGE LLC
+employer: EXAMPLE CREDIT UNION
+addr: 1234 EXAMPLE STREET, SAMPLETOWN, CA 90000
+addr: 500 INDUSTRY WAY, SAMPLETOWN, CA 90001
+acct: 00012345678
+acct: 98765432
