@@ -6,6 +6,7 @@
 redacted/
 # sensitive wherever it lives (CLAUDE.md rule 4)
 redaction_list.txt
+master_redaction_list.txt
 
 !testdata/
 !testdata/**

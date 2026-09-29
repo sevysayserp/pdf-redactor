@@ -19,6 +19,8 @@ def test_documents_and_lists_are_ignored_everywhere():
     assert check_ignore("private/2025/redacted/w2.txt")
     assert check_ignore("redaction_list.txt")
     assert check_ignore("private/redaction_list.txt")
+    assert check_ignore("master_redaction_list.txt")
+    assert check_ignore("private/master_redaction_list.txt")
 
 
 def test_fake_testdata_is_not_ignored():

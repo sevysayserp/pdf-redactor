@@ -13,7 +13,10 @@ at the place the sanitized copies should live.
 
 Usage:
     python redact.py <folder|file.pdf> [--out DIR] [--preview] [--yes]
-                     [--no-ocr] [--no-pdf] [--report PATH] [--list PATH]
+                     [--no-ocr] [--no-pdf] [--no-flatten] [--no-signatures]
+                     [--keep-certificate]
+                     [--report PATH] [--list PATH]
+                     [--master PATH | --no-master]
     python redact.py <folder>/redacted --audit   # leak-audit extracts + PDFs
     pdf-redact ...                                # same, after `pip install .`
 
@@ -22,6 +25,21 @@ or two levels up) is created on first run if none is found, and every run
 appends candidate entries found on name-labeled lines. To reject a candidate,
 comment it out — it is then never re-added.
 
+A master list (--master, default ~/.config/pdf-redactor/
+master_redaction_list.txt) holds entries common to every folder — your own
+name, address, ... It has the same format, is merged into every run, and is
+never written by the script. --no-master skips it.
+
+Fillable form fields and annotations are flattened into the page in memory
+before extraction, so their contents are redacted too (--no-flatten skips
+this). The source file is never modified.
+
+Signature blocks (DocuSign-style stamps, signature form fields) are boxed as
+a whole — text, image and drawing — under one [SIGNATURE-n] token. In an
+e-signed document every small image counts as a signature, and the
+certificate pages the service appended are left out (--keep-certificate).
+--no-signatures skips all of this.
+
 --audit prints category + file + line number ONLY — never the matched text —
 so it is safe to run (and read the output of) on real redacted extracts.
 """
@@ -29,6 +47,8 @@ so it is safe to run (and read the output of) on real redacted extracts.
 import argparse
 from datetime import date
 import functools
+import io
+import os
 import re
 import sys
 from collections import defaultdict
@@ -96,10 +116,27 @@ _CITY_CORE = (r"[A-Za-z][A-Za-z.]*(?:\s[A-Za-z.]+){0,2},?\s+(?:%s)\s+\d{5}(?:-\d
               % US_STATE)
 CITY_EDGE_OCR = re.compile(
     r"(?:^\s*%s(?=\s\s|\s*$))|(?:(?<=\s)%s\s*$)" % (_CITY_CORE, _CITY_CORE), re.I)
+# E-signature stamps: the signer ID printed under a DocuSign signature
+# ("A1B2C3D4E5F64A7...") and the envelope uuid in the page header.
+DOCUSIGN_ID = re.compile(r"(?<![0-9A-Za-z])[0-9A-F]{12,}\.{3}")
+ENVELOPE_CONTEXT = re.compile(r"ENVELOPE\s+ID", re.I)
+ENVELOPE_ID = re.compile(
+    r"(?<![0-9A-Za-z])[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}(?![0-9A-Za-z])",
+    re.I)
+# Label of a signature stamp; the block under it is boxed as a region (see
+# find_signature_regions). A bare "Signed by:" counts only with an ID below.
+SIG_LABEL = re.compile(r"(Docu)?Signed\s+by:", re.I)
+SIG_LABEL_STRICT = re.compile(r"DocuSigned\s+by:", re.I)
+# Signs that a document went through an e-signature service; only then are
+# small images taken for signatures and certificate pages dropped.
+ESIGN_HEADER = re.compile(r"DOCU\s*SIGN\s+ENVELOPE\s+ID", re.I)
+CERT_TITLE = re.compile(r"CERTIFICATE\s+OF\s+COMPLETION", re.I)
 FORM_VOCAB = re.compile(r"SCHEDULE|\bFORM\b|\bBOX\b|\bLINE\b|\bPAGE\b", re.I)
 
 # (pattern, token kind, reason tag, required line context, excluding line context)
 PATTERN_RULES = [
+    (DOCUSIGN_ID, "SIGNATURE", "[PATTERN:SIGNATURE]", None, None),
+    (ENVELOPE_ID, "ENVELOPE", "[PATTERN:ENVELOPE]", ENVELOPE_CONTEXT, None),
     (SSN_SEP, "SSN", "[PATTERN:SSN]", None, None),
     (SSN_SPACED, "SSN", "[PATTERN:SSN]", None, None),
     (SSN_BARE, "SSN", "[PATTERN:SSN]", SSN_CONTEXT, None),
@@ -218,6 +255,16 @@ def load_list(path):
     return entries
 
 
+def load_lists(*paths):
+    """Merge several lists (master first, then the folder's) into one entry
+    list; an entry present in more than one list is kept once."""
+    merged = {}
+    for path in paths:
+        for entry in load_list(path):
+            merged.setdefault((entry[0], _norm_value(entry[2])), entry)
+    return sorted(merged.values(), key=lambda e: len(e[3].pattern), reverse=True)
+
+
 def _norm_value(value):
     return " ".join(value.split()).upper()
 
@@ -269,7 +316,8 @@ def _shadow(s):
     return "".join(chars)
 
 
-def redact_text(text, entries, tokens, findings, ocr=False, spans=None, sweep=()):
+def redact_text(text, entries, tokens, findings, ocr=False, spans=None, sweep=(),
+                presets=None):
     """Redact one document's text. findings[(reason, original, token)] += n.
 
     sweep = [(kind, value, rx)]: literal values a pattern found elsewhere in
@@ -280,6 +328,9 @@ def redact_text(text, entries, tokens, findings, ocr=False, spans=None, sweep=()
     spans, if a list, receives (line_index, start, end, token) for every
     substitution; start/end index the ORIGINAL line, so the same match that
     produced the token can be located on the page (see redaction_rects).
+    presets = {line_index: [(start, end, key)]}: stretches inside a signature
+    region (see signature_presets), replaced first with the region's
+    [SIGNATURE-n] token. They add no spans: the region is boxed as a whole.
     """
     flex = ocr_rx if ocr else (lambda rx: rx)
     out_lines = []
@@ -287,6 +338,15 @@ def redact_text(text, entries, tokens, findings, ocr=False, spans=None, sweep=()
         s = line
         # orig_of[i] = index in `line` of s[i], or None inside an inserted token
         orig_of = list(range(len(line)))
+        if presets and li in presets:
+            parts, omap, last = [], [], 0
+            for a, b, key in sorted(presets[li]):
+                tok = tokens.token("SIGNATURE", key)
+                findings[("[SIGNATURE]", line[a:b].strip(), tok)] += 1
+                parts += [line[last:a], tok]
+                omap += list(range(last, a)) + [None] * len(tok)
+                last = b
+            s, orig_of = "".join(parts) + line[last:], omap + list(range(last, len(line)))
 
         def substitute(rx, kind, reason, s, orig_of, canonical=None, shadow=False):
             src = _shadow(s) if shadow else s  # _shadow keeps length
@@ -363,11 +423,16 @@ def _split_lines_with_boxes(text, boxes):
     return lines or [("", [])]
 
 
+def _as_file(src):
+    """A PDF source is a path, or the bytes of an in-memory flattened copy."""
+    return io.BytesIO(src) if isinstance(src, bytes) else src
+
+
 def extract_pdf_pages(pdf_path):
     """Text-layer pages, built from the same textmap page.extract_text()
     returns, so the joined text is what the text path has always seen."""
     pages = []
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(_as_file(pdf_path)) as pdf:
         for page in pdf.pages:
             tm = page.get_textmap()
             text = "".join(ch for ch, _obj in tm.tuples)
@@ -469,7 +534,8 @@ def ocr_pdf_pages(pdf_path):
     from rapidocr_onnxruntime import RapidOCR
     if _OCR_ENGINE is None:
         _OCR_ENGINE = RapidOCR()
-    doc = pdfium.PdfDocument(str(pdf_path))
+    doc = pdfium.PdfDocument(pdf_path if isinstance(pdf_path, bytes)
+                             else str(pdf_path))
     try:
         pages = []
         for i in range(len(doc)):
@@ -491,20 +557,252 @@ def ocr_pdf_text(pdf_path):
 
 
 # --------------------------------------------------------------- redacted PDF
-PDF_SKIP_HINT = ("flatten it (print to PDF) and re-run; note its .txt extract "
-                 "may also be missing values typed into form fields")
+PDF_SKIP_HINT = ("print it to PDF and re-run on the copy; with --no-flatten "
+                 "its .txt extract may also be missing values typed into "
+                 "form fields")
 
 
-def write_redacted_pdf(src, dst, rects_by_page, ocr_layer=()):
+def _open_pymupdf(src):
+    import pymupdf
+    if isinstance(src, bytes):
+        return pymupdf.open(stream=src, filetype="pdf")
+    return pymupdf.open(str(src))
+
+
+def flatten_pdf(pdf_path):
+    """Merge form-field and annotation contents into the page content so they
+    are extracted, redacted and audited like page text. In memory only: the
+    source is never modified and no flattened copy touches the disk.
+    -> None if there is nothing to flatten, else (pdf_bytes, field_values,
+    sig_rects): field_values are the non-empty text-field values, for
+    unflattened_count(); sig_rects = [(page_idx, (x0, top, x1, bottom))] of
+    the signature fields, for find_signature_regions()."""
+    import pymupdf
+    doc = _open_pymupdf(pdf_path)
+    try:
+        widgets, sig_rects = [], []
+        for page in doc:
+            for w in page.widgets():
+                widgets.append(w)
+                if w.field_type == pymupdf.PDF_WIDGET_TYPE_SIGNATURE:
+                    sig_rects.append((page.number, tuple(w.rect)))
+        if not widgets and not any(next(page.annots(), None) is not None
+                                   for page in doc):
+            return None
+        values = [w.field_value for w in widgets
+                  if w.field_type == pymupdf.PDF_WIDGET_TYPE_TEXT
+                  and isinstance(w.field_value, str) and w.field_value.strip()]
+        doc.bake(annots=True, widgets=True)
+        return doc.tobytes(garbage=4, deflate=True), values, sig_rects
+    finally:
+        doc.close()
+
+
+def is_esigned(src, sig_fields=()):
+    """Did this document go through an e-signature service? True on a
+    signature form field (visible or not), an envelope-ID page header, or a
+    stamp label / signer ID in the text."""
+    if sig_fields:
+        return True
+    doc = _open_pymupdf(src)
+    try:
+        return any(rx.search(page.get_text())
+                   for page in doc
+                   for rx in (ESIGN_HEADER, SIG_LABEL_STRICT, DOCUSIGN_ID))
+    finally:
+        doc.close()
+
+
+def certificate_start(doc):
+    """0-based index of the first e-signature certificate page, or None. A
+    certificate on the very first page is not one appended to a document."""
+    for page in doc:
+        if page.number and CERT_TITLE.search(page.get_text()):
+            return page.number
+    return None
+
+
+def drop_certificate_pages(src):
+    """Leave out the certificate an e-signature service appends (signer
+    names, emails, IP addresses, timestamps): its first page and every page
+    after it. In memory only, like flatten_pdf.
+    -> None if there is none, else (pdf_bytes, first_dropped, last_dropped),
+    1-based."""
+    doc = _open_pymupdf(src)
+    try:
+        start, total = certificate_start(doc), len(doc)
+        if start is None:
+            return None
+        doc.select(list(range(start)))
+        return doc.tobytes(garbage=4, deflate=True), start + 1, total
+    finally:
+        doc.close()
+
+
+def unflattened_count(field_values, text):
+    """How many field values are absent from the flattened text (a field with
+    no rendered appearance bakes to nothing). A count, never the values."""
+    squeezed = "".join(text.split())
+    return sum(1 for v in field_values if "".join(v.split()) not in squeezed)
+
+
+SIG_ID_REACH = 120          # max points from a stamp label down to its ID line
+SIG_ID_SHIFT = 40           # max horizontal offset between label and ID line
+SIG_DEFAULT_AREA = (180, 60)  # boxed under a label that has no ID line
+SIG_MAX_GRAPHIC = (0.6, 200)  # page-width share / height of a stamp graphic
+SIG_PAD = 2
+SIG_MIN_FIELD = 5           # a smaller signature field is invisible: no box
+SIG_MIN_IMAGE = (10, 5)     # smaller images are specks, not signatures
+SIG_REACH = 14              # how far a stamp's frame/label lies from its image
+SIG_FRAME = (1.6, 120, 100)   # frame width: share of image width / floor; height
+SIG_SMALL_PRINT = (160, 9.8)  # label/ID line: max width, max height (~8 pt type)
+
+
+def _intersects(a, b):
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _gap(a, b):
+    """Distance between two boxes; 0 if they touch or overlap."""
+    return max(a[0] - b[2], b[0] - a[2], a[1] - b[3], b[1] - a[3], 0)
+
+
+def _image_stamps(page):
+    """Small images on a page, each widened by the frame drawings and small
+    print around it: the signature stamps of an e-signed document whose label
+    and ID line are not readable text."""
+    pw = page.rect.width
+    log = [(kind, tuple(r)) for kind, r in page.get_bboxlog()]
+    out = []
+    for kind, seed in log:
+        w, h = seed[2] - seed[0], seed[3] - seed[1]
+        if ("image" not in kind or w < SIG_MIN_IMAGE[0] or h < SIG_MIN_IMAGE[1]
+                or w > SIG_MAX_GRAPHIC[0] * pw or h > SIG_MAX_GRAPHIC[1]):
+            continue
+        frame_w = max(SIG_FRAME[0] * w, SIG_FRAME[1])
+        near = [r for k, r in log
+                if ("path" in k and r[2] - r[0] <= frame_w
+                    and r[3] - r[1] <= SIG_FRAME[2])
+                or ("text" in k and r[2] - r[0] <= SIG_SMALL_PRINT[0]
+                    and r[3] - r[1] <= SIG_SMALL_PRINT[1])]
+        rect = seed
+        for _ in range(2):  # the label sits beyond the frame it belongs to
+            rect = _union([rect] + [r for r in near if _gap(r, rect) <= SIG_REACH])
+        out.append(rect)
+    return out
+
+
+def find_signature_regions(pages, src, widget_rects=(), esigned=False):
+    """Signature blocks to box as a whole: DocuSign-style stamps (label, the
+    signature itself, signer ID line), signature form fields and — in an
+    e-signed document (see is_esigned) — small images with their frames.
+    -> ({page_idx: [(rect, key)]}, pages_without_id). key is the signer ID
+    (one token per signer across the run) or None when there is none;
+    pages_without_id lists 1-based pages where a label had no ID line and a
+    default area was boxed."""
+    found, no_id = defaultdict(list), []
+    for pi, lines in enumerate(pages):
+        ids = []
+        for text, boxes in lines:
+            for m in DOCUSIGN_ID.finditer(text):
+                bx = [x for x in boxes[m.start():m.end()] if x]
+                if bx:
+                    ids.append([_union(bx), m.group(0), False])
+        for text, boxes in lines:
+            for m in SIG_LABEL.finditer(text):
+                bx = [x for x in boxes[m.start():m.end()] if x]
+                if not bx:
+                    continue
+                lab = _union(bx)
+                below = [i for i in ids if not i[2]
+                         and -2 <= i[0][1] - lab[1] <= SIG_ID_REACH
+                         and abs(i[0][0] - lab[0]) <= SIG_ID_SHIFT]
+                if below:
+                    hit = min(below, key=lambda i: i[0][1])
+                    hit[2] = True
+                    found[pi].append((_union([lab, hit[0]]), hit[1]))
+                elif m.group(1):
+                    no_id.append(pi + 1)
+                    found[pi].append(((lab[0], lab[1],
+                                       lab[0] + SIG_DEFAULT_AREA[0],
+                                       lab[3] + SIG_DEFAULT_AREA[1]), None))
+    for pi, rect in widget_rects:
+        if (pi < len(pages) and rect[2] - rect[0] >= SIG_MIN_FIELD
+                and rect[3] - rect[1] >= SIG_MIN_FIELD):
+            found[pi].append((tuple(rect), None))
+    if not found and not esigned:
+        return {}, no_id
+
+    regions = {}
+    doc = _open_pymupdf(src)
+    try:
+        if esigned:
+            for page in doc:
+                found[page.number] += [(r, None) for r in _image_stamps(page)]
+        for pi, items in sorted(found.items()):
+            if not items:
+                continue
+            page = doc[pi]
+            pw, ph = page.rect.width, page.rect.height
+            marks = [tuple(r) for kind, r in page.get_bboxlog()
+                     if not kind.startswith("ignore")
+                     and r[2] - r[0] <= SIG_MAX_GRAPHIC[0] * pw
+                     and r[3] - r[1] <= SIG_MAX_GRAPHIC[1]]
+            merged = []
+            for rect, key in items:
+                rect = _union([rect] + [m for m in marks if _intersects(m, rect)])
+                rect = (max(0, rect[0] - SIG_PAD), max(0, rect[1] - SIG_PAD),
+                        min(pw, rect[2] + SIG_PAD), min(ph, rect[3] + SIG_PAD))
+                for i, (other, okey) in enumerate(merged):
+                    if _intersects(other, rect):
+                        merged[i] = (_union([other, rect]), okey or key)
+                        break
+                else:
+                    merged.append((rect, key))
+            regions[pi] = merged
+    finally:
+        doc.close()
+    return regions, no_id
+
+
+def signature_presets(pages, regions):
+    """The characters of pages_to_text(pages) that lie inside a signature
+    region -> ({line_index: [(start, end, region)]}, regions_with_text) with
+    region = (page_idx, n), the n-th region of that page."""
+    presets, with_text = defaultdict(list), set()
+    for li, loc in enumerate(_line_map(pages)):
+        if loc is None or loc[0] not in regions:
+            continue
+        boxes = pages[loc[0]][loc[1]][1]
+        for n, (rect, _key) in enumerate(regions[loc[0]]):
+            inside = [i for i, b in enumerate(boxes) if b
+                      and rect[0] <= (b[0] + b[2]) / 2 <= rect[2]
+                      and rect[1] <= (b[1] + b[3]) / 2 <= rect[3]]
+            start = prev = None
+            for i in inside + [None]:
+                if start is not None and (
+                        i is None or any(boxes[prev + 1:i])):
+                    presets[li].append((start, prev + 1, (loc[0], n)))
+                    with_text.add((loc[0], n))
+                    start = None
+                if start is None:
+                    start = i
+                prev = i
+    return presets, with_text
+
+
+def write_redacted_pdf(src, dst, rects_by_page, ocr_layer=(), sig_rects=None):
     """True-redact src into dst: a black box with the white token label over
     each rect, the underlying text and image pixels removed, then metadata,
-    attachments, links and hidden text scrubbed. ocr_layer =
+    attachments, links and hidden text scrubbed. sig_rects = {page_idx:
+    [(rect, token)]} are signature regions: boxed first, and any line art
+    they touch is removed with them. ocr_layer =
     [(page_idx, (x0, top, x1, bottom), text)] of REDACTED OCR lines written
     back as invisible text so a scanned PDF stays searchable. Returns None on
     success, else a reason the PDF was skipped: fillable/annotated, rotated
     or cropped pages are not safely redactable by this path."""
     import pymupdf
-    doc = pymupdf.open(str(src))
+    doc = _open_pymupdf(src)
     try:
         if doc.is_form_pdf:
             return "has fillable form fields"
@@ -517,6 +815,15 @@ def write_redacted_pdf(src, dst, rects_by_page, ocr_layer=()):
                     or next(page.annots(), None) is not None):
                 return "has form fields or annotations"
         for pi, page in enumerate(doc):
+            sigs = (sig_rects or {}).get(pi, ())
+            for rect, tok in sigs:
+                page.add_redact_annot(pymupdf.Rect(rect), text=tok, fill=(0, 0, 0),
+                                      text_color=(1, 1, 1), cross_out=False,
+                                      fontsize=8)
+            if sigs:
+                page.apply_redactions(
+                    images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED)
             rects = rects_by_page.get(pi, ())
             for (x0, top, x1, bottom), tok in rects:
                 inset = min(0.5, (bottom - top) / 4)  # spare neighbouring glyphs
@@ -540,14 +847,39 @@ def write_redacted_pdf(src, dst, rects_by_page, ocr_layer=()):
     return None
 
 
-def verify_redacted_pdf(dst, entries, ocr=False, sweep=()):
+def _same_rect(a, b, tol=1.5):
+    return all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
+def verify_redacted_pdf(dst, entries, ocr=False, sweep=(), sig_rects=None,
+                        signatures=True):
     """Re-extract the saved PDF with the same extractor and audit it with the
     same rules; also require that no metadata, widgets, annotations or
-    embedded files remain. -> list of (line, reason) FAILs; empty = clean."""
+    embedded files remain, and that nothing but the box is left in a
+    signature region. -> list of (line, reason) FAILs; empty = clean."""
     import pymupdf
-    fails, _warns = audit_text(extract_pdf_text(dst), entries, ocr=ocr, sweep=sweep)
+    fails, _warns = audit_text(extract_pdf_text(dst), entries, ocr=ocr, sweep=sweep,
+                               signatures=signatures)
     doc = pymupdf.open(str(dst))
     try:
+        for pi, sigs in (sig_rects or {}).items():
+            log = [(kind, tuple(r)) for kind, r in doc[pi].get_bboxlog()]
+            for rect, _tok in sigs:
+                inner = (rect[0] + 1, rect[1] + 1, rect[2] - 1, rect[3] - 1)
+                for kind, r in log:
+                    if not _intersects(r, inner):
+                        continue
+                    if "image" in kind:  # partly covered: pixels were blanked
+                        left = (r[0] >= rect[0] - 1 and r[1] >= rect[1] - 1
+                                and r[2] <= rect[2] + 1 and r[3] <= rect[3] + 1)
+                    elif "path" in kind or "shade" in kind:
+                        left = not _same_rect(r, rect)  # our own box is fine
+                    else:
+                        left = False
+                    if left:
+                        fails.append((pi + 1, "signature graphics remain"))
+                        break
+
         for key in ("author", "title", "subject", "keywords"):
             if doc.metadata.get(key):
                 fails.append((0, f"metadata:{key} remains"))
@@ -610,7 +942,7 @@ def _significant_caps(word):
     return not _segments_into_stopwords(w.replace("'", ""))
 
 
-def audit_text(text, entries, ocr=False, sweep=()):
+def audit_text(text, entries, ocr=False, sweep=(), signatures=True):
     """-> (fails, warns): lists of (line_number, category). No values, ever."""
     flex = ocr_rx if ocr else (lambda rx: rx)
     fails, warns = [], []
@@ -634,6 +966,8 @@ def audit_text(text, entries, ocr=False, sweep=()):
             if flex(rx).search(line) or (
                     ocr and kind in SHADOW_KINDS and rx.search(_shadow(line))):
                 hit.add(reason)
+        if signatures and flex(SIG_LABEL_STRICT).search(line):
+            hit.add("[SIGNATURE] stamp label remains")
         fails += [(ln, reason) for reason in sorted(hit)]
 
         stripped = TOKEN_RX.sub(" ", line)
@@ -673,6 +1007,9 @@ LIST_TEMPLATE = """\
 # name-labeled lines of your PDFs under a dated '# auto-added' header. Review
 # them; to REJECT one, comment it out (keep the line) — a commented-out entry
 # is never redacted and never re-added.
+#
+# Entries common to every folder (your own name, address, ...) belong in the
+# master list instead — see --master in `redact.py --help`.
 #
 # name: JOHN Q TAXPAYER
 # employer: SOME BANK NA
@@ -714,8 +1051,11 @@ def suggest_entries(raw_texts, entries, seen=()):
     return out
 
 
-def format_report(findings_by_file, warnings, list_desc, unused=(), added=()):
+def format_report(findings_by_file, warnings, list_desc, unused=(), added=(),
+                  master_desc=None):
     lines = ["REDACTION PREVIEW", f"redaction list: {list_desc}"]
+    if master_desc:
+        lines.append(f"master list: {master_desc}")
     if added:
         lines.append(f"  added {len(added)} new entr{'y' if len(added) == 1 else 'ies'} "
                      "to the list (review; comment out any that are wrong):")
@@ -750,6 +1090,20 @@ def format_report(findings_by_file, warnings, list_desc, unused=(), added=()):
     return "\n".join(lines)
 
 
+CANNOT_WRITE = ("error: cannot write {out} — if it is open in a PDF viewer or "
+                "another program, close it and re-run. The file on disk is "
+                "from an EARLIER run; do not hand it off.")
+
+
+def _is_write_error(exc):
+    """A failure to replace the output file (e.g. locked by a viewer), as
+    opposed to a failure inside the redaction itself."""
+    return isinstance(exc, OSError) or any(
+        hint in str(exc).lower()
+        for hint in ("permission denied", "cannot remove file", "cannot open file",
+                     "cannot rename"))
+
+
 def default_list_path(folder):
     """redaction_list.txt in the folder, else one or two levels up; if none
     exists, the folder's own path (to be created)."""
@@ -761,6 +1115,75 @@ def default_list_path(folder):
         if candidate.is_file():
             return candidate
     return candidates[0]
+
+
+MASTER_LIST_NAME = "master_redaction_list.txt"
+
+
+def default_master_path():
+    """The master list: entries shared by every run (your own name, address,
+    ...). Lives in the user's config directory, never next to the script."""
+    config = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(config) / "pdf-redactor" / MASTER_LIST_NAME
+
+
+SIG_MENTION = re.compile(r"docu\s*sign|signed\s*by|signature", re.I)
+
+
+def inspect_pdf(pdf_path, flatten=True):
+    """Structure of a PDF as the signature detection sees it -> report lines.
+    Counts, kinds and sizes ONLY — never document text — so the output is
+    safe to share when a signature was not boxed."""
+    from collections import Counter
+    lines = []
+    doc = _open_pymupdf(pdf_path)
+    try:
+        fields = Counter(w.field_type_string for page in doc for w in page.widgets())
+        annots = Counter(a.type[1] for page in doc for a in page.annots())
+    finally:
+        doc.close()
+    src, sig_fields = pdf_path, ()
+    flat = flatten_pdf(pdf_path) if flatten else None
+    if flat:
+        src, _values, sig_fields = flat
+    esigned = is_esigned(src, sig_fields)
+    count = lambda c: ", ".join(f"{k}={v}" for k, v in sorted(c.items())) or "none"
+    lines.append(f"  form fields: {count(fields)}; annotations: {count(annots)}; "
+                 f"flattened: {'yes' if flat else 'no'}; "
+                 f"e-signed: {'yes' if esigned else 'no'}")
+    pages = extract_pdf_pages(src)
+    regions, no_id = find_signature_regions(pages, src, sig_fields, esigned)
+    doc = _open_pymupdf(src)
+    try:
+        cert = certificate_start(doc) if esigned else None
+        lines.append("  certificate pages: "
+                     + ("none found" if cert is None else
+                        f"{cert + 1}-{len(doc)} (dropped from the output unless "
+                        "--keep-certificate; regions there do not apply)"))
+        for pi, page_lines in enumerate(pages):
+            texts = [t for t, _b in page_lines]
+            log = [(kind, r) for kind, r in doc[pi].get_bboxlog()]
+            images = [r for kind, r in log if "image" in kind]
+            small = sorted({f"{r[2] - r[0]:.0f}x{r[3] - r[1]:.0f}" for r in images
+                            if r[2] - r[0] <= SIG_MAX_GRAPHIC[0] * doc[pi].rect.width
+                            and r[3] - r[1] <= SIG_MAX_GRAPHIC[1]})
+            lines.append(
+                f"  page {pi + 1}: {sum(len(t.strip()) for t in texts)} text chars, "
+                f"{len(images)} image(s), "
+                f"{sum('path' in kind for kind, _r in log)} drawing(s); "
+                f"stamp labels: {sum(len(SIG_LABEL_STRICT.findall(t)) for t in texts)} "
+                f"DocuSigned / {sum(len(SIG_LABEL.findall(t)) for t in texts)} any; "
+                f"signer IDs: {sum(len(DOCUSIGN_ID.findall(t)) for t in texts)}; "
+                f"lines mentioning signing: "
+                f"{sum(bool(SIG_MENTION.search(t)) for t in texts)}; "
+                f"regions: {len(regions.get(pi, ()))}"
+                + ("".join(f" [{r[2] - r[0]:.0f}x{r[3] - r[1]:.0f} pt]"
+                           for r, _k in regions.get(pi, ())))
+                + (f"; small images (pt): {', '.join(small)}" if small else "")
+                + ("; label without ID line" if pi + 1 in no_id else ""))
+    finally:
+        doc.close()
+    return lines
 
 
 def main(argv=None):
@@ -780,6 +1203,19 @@ def main(argv=None):
                     help="do not OCR scanned PDFs that have no text layer; by "
                          "default they are OCR'd locally (RapidOCR) and the "
                          "extract is stamped OCR-DERIVED — verify amounts")
+    ap.add_argument("--no-flatten", dest="flatten", action="store_false",
+                    help="do not flatten form fields and annotations into "
+                         "the page (in memory) before extraction; such PDFs "
+                         "then get a .txt extract only, without the values "
+                         "typed into fields")
+    ap.add_argument("--no-signatures", dest="signatures", action="store_false",
+                    help="do not box signature blocks (DocuSign-style stamps "
+                         "and signature form fields) as a whole; signer and "
+                         "envelope IDs are still redacted by pattern")
+    ap.add_argument("--keep-certificate", dest="certificate", action="store_false",
+                    help="keep the certificate pages an e-signature service "
+                         "appends (signer names, emails, IP addresses); by "
+                         "default they are left out of the output")
     ap.add_argument("--no-pdf", dest="pdf", action="store_false",
                     help="do not write <stem>.redacted.pdf next to each .txt "
                          "extract (true redaction: text removed under black "
@@ -790,6 +1226,16 @@ def main(argv=None):
                     help="redaction list (default: <folder>/redaction_list.txt, "
                          "then one or two levels up; created in <folder> if "
                          "none exists). Candidate entries are appended each run")
+    ap.add_argument("--master", dest="master_path", metavar="PATH",
+                    help="master redaction list merged into every run "
+                         f"(default: {default_master_path()}); same format as "
+                         "the redaction list, never written by the script")
+    ap.add_argument("--no-master", dest="master", action="store_false",
+                    help="do not load the master redaction list")
+    ap.add_argument("--inspect", action="store_true",
+                    help="print the structure of the raw PDFs as the signature "
+                         "detection sees it (counts and sizes only, never "
+                         "text) and exit; nothing is written")
     ap.add_argument("--audit", action="store_true",
                     help="leak-audit already-redacted .txt extracts in <folder>; "
                          "prints categories + line numbers only, never values")
@@ -815,9 +1261,19 @@ def main(argv=None):
     if out_dir.resolve() == folder.resolve():
         sys.exit("error: --out must not be the raw folder itself")
 
-    entries = load_list(list_path)
+    if not args.master:
+        master_path, master_desc = None, "skipped (--no-master)"
+    else:
+        if args.master_path and not Path(args.master_path).is_file():
+            sys.exit(f"error: master list {args.master_path} is not a file")
+        master_path = Path(args.master_path) if args.master_path else default_master_path()
+        master_desc = (f"found {master_path} ({len(load_list(master_path))} entries)"
+                       if master_path.is_file() else
+                       f"none (create {master_path} to share entries across folders)")
+
+    entries = load_lists(master_path, list_path)
     warnings = []
-    list_desc = (f"found {list_path} ({len(entries)} entries)"
+    list_desc = (f"found {list_path} ({len(load_list(list_path))} entries)"
                  if list_path.is_file() else "NONE")
 
     if args.audit:
@@ -826,7 +1282,8 @@ def main(argv=None):
         txts = [t for t in txts if t.name != "redaction_list.txt"]
         if not txts:
             sys.exit(f"error: no .txt extracts or .redacted.pdf files found in {folder}")
-        print(f"LEAK AUDIT of {len(txts)} extract(s)  (list: {list_desc})")
+        print(f"LEAK AUDIT of {len(txts)} extract(s)  (list: {list_desc}; "
+              f"master list: {master_desc})")
         n_fail = n_warn = 0
         for t in txts:
             if t.suffix.lower() == ".pdf":
@@ -834,7 +1291,8 @@ def main(argv=None):
             else:
                 text = t.read_text()
                 is_ocr = _is_ocr_extract(text)
-            fails, warns = audit_text(text, entries, ocr=is_ocr)
+            fails, warns = audit_text(text, entries, ocr=is_ocr,
+                                      signatures=args.signatures)
             for ln, reason in fails:
                 print(f"  FAIL {t.name} line {ln}: {reason}")
                 n_fail += 1
@@ -848,6 +1306,12 @@ def main(argv=None):
     pdfs = [single] if single else sorted(folder.glob("*.pdf"))
     if not pdfs:
         sys.exit(f"error: no PDFs found in {folder}")
+    if args.inspect:
+        print("INSPECT (structure only — no document text)")
+        for n, pdf in enumerate(pdfs, 1):
+            print(f"file {n} of {len(pdfs)}:")  # not the name: it may identify
+            print("\n".join(inspect_pdf(pdf, args.flatten)))
+        return 0
     if single and not args.preview:
         warnings.append("SINGLE-FILE RUN: tokens are numbered per run, so "
                         f"this extract's tokens will not line up with a "
@@ -857,13 +1321,37 @@ def main(argv=None):
     raw_texts = {}
     pages_by_name = {}
     src_by_name = {}
+    regions_by_name = {}
     ocr_files = set()
     for pdf in pdfs:
-        pages = extract_pdf_pages(pdf)
+        src, field_values, sig_fields = pdf, (), ()
+        if args.flatten:
+            try:
+                flat = flatten_pdf(pdf)
+            except Exception as exc:  # any PyMuPDF failure: keep the old path
+                flat = None
+                warnings.append(f"FLATTEN FAILED: {pdf.name} "
+                                f"({type(exc).__name__}) — processed as is")
+            if flat:
+                src, field_values, sig_fields = flat
+                warnings.append(f"FLATTENED: {pdf.name} had form fields/"
+                                "annotations; their contents were merged into "
+                                "the page and redacted like page text")
+        esigned = args.signatures and is_esigned(src, sig_fields)
+        if esigned and args.certificate:
+            cut = drop_certificate_pages(src)
+            if cut:
+                src, first, last = cut
+                warnings.append(f"CERTIFICATE DROPPED: {pdf.name} — page"
+                                + (f" {first}" if first == last
+                                   else f"s {first}-{last}")
+                                + " (e-signature certificate) left out of the "
+                                "output")
+        pages = extract_pdf_pages(src)
         text = pages_to_text(pages)
         if len(text.strip()) < 20:
             if args.ocr:
-                pages = ocr_pdf_pages(pdf)
+                pages = ocr_pdf_pages(src)
                 text = pages_to_text(pages)
                 if len(text.strip()) >= 20:
                     ocr_files.add(pdf.name)
@@ -876,51 +1364,84 @@ def main(argv=None):
                                 "will be written for it"
                                 + ("" if args.ocr else "; re-run without --no-ocr"))
                 continue
+        missing = unflattened_count(field_values, text)
+        if missing:
+            warnings.append(f"FLATTEN INCOMPLETE: {pdf.name} — {missing} field "
+                            "value(s) not in the extract; check the original")
         raw_texts[pdf.name] = text
         pages_by_name[pdf.name] = pages
-        src_by_name[pdf.name] = pdf
+        src_by_name[pdf.name] = src
+        if args.signatures:
+            regions, no_id = find_signature_regions(pages, src, sig_fields,
+                                                    esigned)
+            regions_by_name[pdf.name] = regions
+            for page_no in no_id:
+                warnings.append(f"SIGNATURE: {pdf.name} page {page_no} — stamp "
+                                "without an ID line, default area boxed; check "
+                                "the redacted PDF")
 
     # Redaction list: create if missing, append new candidates, reload so the
     # additions take effect in this same run (preview included).
-    added = suggest_entries(raw_texts, entries, list_seen_values(list_path))
+    added = suggest_entries(raw_texts, entries,
+                            list_seen_values(list_path) | list_seen_values(master_path))
     created = append_list_entries(list_path, added, folder.name or str(folder)) \
         if (added or not list_path.is_file()) else False
     if added or created:
-        entries = load_list(list_path)
-    list_desc = f"{'created' if created else 'found'} {list_path} ({len(entries)} entries)"
+        entries = load_lists(master_path, list_path)
+    folder_entries = load_list(list_path)
+    list_desc = (f"{'created' if created else 'found'} {list_path} "
+                 f"({len(folder_entries)} entries)")
     if not entries:
         warnings.append("no redaction list entries loaded — names, employers and "
                         "addresses will NOT be redacted (patterns only)")
 
     def redact_all(sweep):
         tokens = TokenMap()
-        redacted, findings_by_file, spans_by_name = {}, {}, {}
+        redacted, findings_by_file, spans_by_name, sigs_by_name = {}, {}, {}, {}
         for name, text in raw_texts.items():
             findings, spans = defaultdict(int), []
+            regions = regions_by_name.get(name, {})
+            presets, with_text = signature_presets(pages_by_name[name], regions)
+            # a stamp without a signer ID gets a token of its own
+            keys = {(pi, n): key or f"{name} page {pi + 1} #{n + 1}"
+                    for pi, items in regions.items()
+                    for n, (_rect, key) in enumerate(items)}
+            sigs = defaultdict(list)
+            for (pi, n), key in sorted(keys.items()):
+                tok = tokens.token("SIGNATURE", key)
+                sigs[pi].append((regions[pi][n][0], tok))
+                if (pi, n) not in with_text:  # image-only: nothing in the text
+                    findings[("[SIGNATURE]",
+                              f"(signature block, page {pi + 1})", tok)] += 1
+            presets = {li: [(a, b, keys[r]) for a, b, r in items]
+                       for li, items in presets.items()}
             redacted[name] = redact_text(text, entries, tokens, findings,
                                          ocr=name in ocr_files, spans=spans,
-                                         sweep=sweep)
+                                         sweep=sweep, presets=presets)
             findings_by_file[name] = findings
             spans_by_name[name] = spans
-        return redacted, findings_by_file, spans_by_name
+            sigs_by_name[name] = sigs
+        return redacted, findings_by_file, spans_by_name, sigs_by_name
 
     # Pass 1 finds values by pattern; pass 2 also redacts each of those
     # values literally wherever else it appears in the run (any line, any
     # file — e.g. a city/state/zip merged into an OCR row), like list entries.
-    redacted, findings_by_file, spans_by_name = redact_all(())
+    redacted, findings_by_file, spans_by_name, sigs_by_name = redact_all(())
     sweep_values = sorted({(reason[len("[PATTERN:"):-1].split(":")[0], orig)
                            for f in findings_by_file.values()
                            for reason, orig, _tok in f
                            if reason.startswith("[PATTERN:")})
     sweep = [(kind, val, _literal_rx(val)) for kind, val in sweep_values]
     if sweep:
-        redacted, findings_by_file, spans_by_name = redact_all(sweep)
+        redacted, findings_by_file, spans_by_name, sigs_by_name = redact_all(sweep)
 
     used = {orig for f in findings_by_file.values()
             for (reason, orig, _tok) in f if reason.startswith("[LIST")}
-    unused = sorted({(c, v) for c, v, _var, _rx in entries if v not in used})
+    # Folder entries only: a master entry missing from one folder is normal.
+    unused = sorted({(c, v) for c, v, _var, _rx in folder_entries if v not in used})
 
-    report = format_report(findings_by_file, warnings, list_desc, unused, added)
+    report = format_report(findings_by_file, warnings, list_desc, unused, added,
+                           master_desc)
     print(report)
     if args.report:
         Path(args.report).write_text(report + "\n")
@@ -946,7 +1467,10 @@ def main(argv=None):
         header = (f"# Redacted extract of {name} — generated by pdf-redactor; "
                   f"tokens like [SSN-1] are stable across this run's extracts."
                   f"{ocr_note}\n\n")
-        out.write_text(header + text)
+        try:
+            out.write_text(header + text)
+        except OSError:
+            sys.exit(CANNOT_WRITE.format(out=out))
         written.append(out)
 
     # Self-check: audit every output with the same rules; any FAIL means
@@ -957,7 +1481,7 @@ def main(argv=None):
     for out in written:
         text = out.read_text()
         fails, warns = audit_text(text, entries, ocr=_is_ocr_extract(text),
-                                  sweep=sweep)
+                                  sweep=sweep, signatures=args.signatures)
         if fails:
             failed.append(out.name)
             out.unlink()
@@ -990,12 +1514,19 @@ def main(argv=None):
                     bx = [x for x in pages[loc[0]][loc[1]][1] if x]
                     if bx:
                         ocr_layer.append((loc[0], _union(bx), rline))
-            reason = write_redacted_pdf(src_by_name[name], dst, rects, ocr_layer)
+            try:
+                reason = write_redacted_pdf(src_by_name[name], dst, rects,
+                                            ocr_layer, sigs_by_name[name])
+            except Exception as exc:  # PyMuPDF raises its own error types
+                if not _is_write_error(exc):
+                    raise
+                sys.exit(CANNOT_WRITE.format(out=dst))
             if reason:
                 print(f"WARNING: PDF SKIPPED: {name} {reason} — {PDF_SKIP_HINT}")
                 continue
             fails = verify_redacted_pdf(dst, entries, ocr=name in ocr_files,
-                                        sweep=sweep)
+                                        sweep=sweep, sig_rects=sigs_by_name[name],
+                                        signatures=args.signatures)
             if fails:
                 dst.unlink()
                 pdf_failed.append(dst.name)

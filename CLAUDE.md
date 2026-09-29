@@ -16,10 +16,15 @@
    fake values from `testdata/` in examples.
 4. `redaction_list.txt` is sensitive wherever it lives (the fake one in
    `testdata/` is the only exception). Do not read a real one; the script
-   consumes it directly.
+   consumes it directly. The same goes for the master list
+   (`~/.config/pdf-redactor/master_redaction_list.txt` or any `--master`
+   path): never read or list it, and run the script with `--no-master` (or
+   a fake `--master` file) during development so its values never reach
+   preview output. The test suite isolates itself via `tests/conftest.py`.
 5. `--audit` and the post-run self-check print categories + line numbers
    only, never matched text, so their output is safe to read and share.
-   Keep it that way: never add matched values to that output.
+   Keep it that way: never add matched values to that output. The same
+   holds for `--inspect` (counts and sizes only, no text, no file names).
 
 ## Project conventions
 

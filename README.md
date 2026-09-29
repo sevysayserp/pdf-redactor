@@ -49,8 +49,9 @@ Pass `--no-pdf` if you only need the text extracts.
 ## Usage
 
 ```bash
-python redact.py <folder|file.pdf> [--out DIR] [--preview] [--yes] [--no-ocr] [--no-pdf] [--report PATH] [--list PATH]
+python redact.py <folder|file.pdf> [--out DIR] [--preview] [--yes] [--no-ocr] [--no-pdf] [--no-flatten] [--no-signatures] [--keep-certificate] [--report PATH] [--list PATH] [--master PATH | --no-master]
 python redact.py <out-dir> --audit          # leak-audit finished extracts + PDFs
+python redact.py <folder|file.pdf> --inspect # why was a signature not boxed? structure only
 ```
 
 `<folder>` holds the raw PDFs. `--out DIR` is where the output goes (default
@@ -77,6 +78,18 @@ log.
    folders, move it up a level or two — the script looks in the folder, then
    one and two levels up (`--list PATH` overrides). The list is sensitive:
    keep it with the raw documents.
+
+   Entries you need on every run (your own name, address, …) go in the
+   **master list** instead, so they are typed once:
+
+   ```bash
+   mkdir -p ~/.config/pdf-redactor
+   nano ~/.config/pdf-redactor/master_redaction_list.txt
+   ```
+
+   Same format as `redaction_list.txt`, e.g. `name: JOHN A SAMPLE`. It is
+   just as sensitive; it lives in your config directory, never in this
+   repository.
 3. **Preview.** Check that every planned redaction and its reason look right
    and that no amounts are being taken:
 
@@ -86,6 +99,9 @@ log.
 
    Watch the summary for `never matched` notes (typo in a list entry?) and
    `OCR APPLIED` notes (scanned documents were OCR'd; verify their amounts).
+   A `FLATTENED` note means a fillable form was flattened so that values
+   typed into its fields are redacted too; `FLATTEN INCOMPLETE` means some
+   field values could not be rendered — check that document by hand.
 4. **Redact.** Same command without `--preview`, plus `--out`; confirm at the
    prompt:
 
@@ -98,7 +114,7 @@ log.
    locally and extending the list.
 5. **Spot-check.** Open two or three `.redacted.pdf` files next to the
    originals: black boxes labeled with tokens over identities, amounts
-   intact; the `.txt` extracts carry the same tokens.
+   intact, every signature covered completely; the `.txt` extracts carry the same tokens.
 6. **Hand off.** Whoever (or whatever) receives the output can run the
    independent audit, whose output is categories and line numbers only:
 
@@ -132,6 +148,39 @@ spot-check.
   (whole-line match, real state codes only, never on lines carrying form
   vocabulary such as SCHEDULE or LINE). Dollar amounts, other dates, and
   box/line numbers are untouched.
+- **Signature blocks.** A DocuSign-style stamp — the `DocuSigned by:`
+  label, the signature itself, and the signer ID line under it — is boxed as
+  one region under a `[SIGNATURE-n]` token: text, image pixels and drawing
+  are all removed. The same signer ID gets the same token throughout the
+  run. A bare `Signed by:` label counts only when a signer ID line follows,
+  so prose is left alone. Signature form fields are boxed the same way.
+  Signer IDs and the `DocuSign Envelope ID` in page headers are also pattern
+  rules (`[PATTERN:SIGNATURE]`, `[PATTERN:ENVELOPE]`). `--no-signatures`
+  turns all of this off.
+  - *E-signed documents.* A document counts as e-signed if it has a
+    `DocuSign Envelope ID` page header, a signature form field (visible or
+    not), or a stamp label / signer ID. In such a document every small image
+    is taken for a signature and boxed together with the frame drawn around
+    it and any small print (about 8 pt and under) right next to it — stamps
+    often carry their label and ID as graphics or in a font that does not
+    extract as text. A small logo in an e-signed document is boxed too.
+    Documents that are not e-signed keep their images.
+  - *Certificate pages.* The certificate an e-signature service appends
+    (signer names, emails, IP addresses, timestamps) is left out of both
+    outputs: the first page titled `Certificate Of Completion` and every
+    page after it. `--keep-certificate` keeps them; they are then redacted
+    like any other page, and IP addresses are not covered by a pattern.
+  - *Not covered:* handwritten signatures in scanned documents, and
+    signatures in documents with none of the e-sign indicators above —
+    check those in the spot-check.
+  Typed `Name:` / `Title:` lines next to a signature are ordinary text and
+  are redacted only if they are in the redaction list.
+- **Inspect (`--inspect`).** Prints how the signature detection sees each
+  raw PDF: counts of form fields, annotations, images, drawings, stamp
+  labels and signer IDs per page, and the size of each region it would box.
+  Counts and sizes only — no document text and no file names — so, like the
+  audit, its output is safe to share when a signature was missed. Writes
+  nothing.
 - **Sweep.** Every value a pattern found is then also redacted literally
   wherever else it appears in the run — any line, any file — like a list
   entry.
@@ -146,6 +195,13 @@ spot-check.
   new ones under a dated `# auto-added` header; a commented-out entry is
   never redacted and never re-added. Entries that never matched are flagged
   in the preview summary.
+- **Master list.** `~/.config/pdf-redactor/master_redaction_list.txt`
+  (`$XDG_CONFIG_HOME` is honored; `--master PATH` overrides, `--no-master`
+  skips) is merged into every run and every `--audit`. An entry in both
+  lists counts once, and an entry commented out in either list is never
+  suggested. The script only reads the master list: candidates are always
+  appended to the folder's list, and a master entry that does not occur in a
+  folder is not reported as never matched.
 - **Stable tokens.** Replacements, not deletions. One value→token map per
   run, so the same SSN on two documents gets the same token. SSN/EIN/account
   values are digit-normalized so formatting variants map to one token; two
@@ -168,10 +224,16 @@ spot-check.
   people and programs; a scanned PDF gets its redacted OCR text written back
   as an invisible layer so it stays searchable. Every PDF is then re-extracted
   and audited with the same rules; a residual match deletes the PDF and fails
-  the run. PDFs with fillable form fields, annotations, rotated or cropped
-  pages are skipped with a `PDF SKIPPED` warning — flatten them (print to
-  PDF) first; field values are invisible to text extraction too, so the
-  `.txt` may be missing them.
+  the run. PDFs with rotated or cropped pages are skipped with a
+  `PDF SKIPPED` warning — print them to PDF first.
+- **Fillable forms and annotations (flattened by default).** Values typed
+  into form fields, and annotation text, are stored apart from the page text
+  and would otherwise be invisible to extraction. They are merged into the
+  page before extraction, so they are previewed, redacted and audited like
+  everything else. This happens in memory: the source file is not modified
+  and no flattened copy is written anywhere. A ticked checkbox may extract as
+  a stray character. `--no-flatten` restores the old behaviour: a `.txt`
+  extract without the field values, and no redacted PDF.
 - **Leak audit (`--audit`).** A second-opinion scan of finished output that
   reports category + file + line number only — never the matched text — so
   its output is safe to read and share. FAIL (exit 1) if any redaction rule
@@ -204,8 +266,9 @@ fake identities (SSN `123-45-6789`, `JOHN A SAMPLE`, `ACME WIDGETS INC`,
 venv/bin/python make_testdata.py [--filing-status {mfj,single}] [--out testdata]
 ```
 
-`.gitignore` ignores every `.pdf`, every `redacted/` folder and every
-`redaction_list.txt` outside `testdata/`, and a test asserts that stays true,
+`.gitignore` ignores every `.pdf`, every `redacted/` folder, every
+`redaction_list.txt` outside `testdata/` and every
+`master_redaction_list.txt`, and a test asserts that stays true,
 so a real document cannot be committed by accident.
 
 ## Privacy rules for development
