@@ -1,6 +1,6 @@
 # Fake redaction list for testdata/ — every entry here is fabricated.
 # Format: one entry per line, optional category prefix
-#   name: / addr: / acct: / employer:   (unprefixed lines default to name)
+#   name: / addr: / acct: / employer: / ssn: / email: / dob: / id: / phone:   (unprefixed lines default to name)
 # Matching is case-insensitive with collapsed whitespace.
 
 name: JOHN A SAMPLE

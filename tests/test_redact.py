@@ -44,6 +44,50 @@ def test_ssn_bare_digits_only_in_labeled_context():
     assert "[ACCT-...6789]" in out2
 
 
+def test_ssn_masked():
+    for masked in ("XXX-XX-4321", "***-**-4321", "xxxxx4321"):
+        out, _ = run_text(f"SSN {masked} WAGES 1,000.00")
+        assert out == "SSN [SSN-1] WAGES 1,000.00", masked
+    # six mask characters: a masked account number, not an SSN
+    out, _ = run_text("ACCOUNT XXXXXX4321")
+    assert "[SSN-" not in out
+
+
+def test_masked_ssn_shares_token_with_full():
+    tokens = redact.TokenMap(ssns=["987-65-4321"])
+    full = tokens.token("SSN", "987-65-4321")
+    assert tokens.token("SSN", "XXX-XX-4321") == full
+    assert tokens.token("SSN", "-4321") == full
+    assert tokens.token("SSN", "XXX-XX-9999") != full
+    plain = redact.TokenMap()
+    assert plain.token("SSN", "987-65-4321") != plain.token("SSN", "XXX-XX-4321")
+    assert plain.token("SSN", "XXX-XX-4321") == plain.token("SSN", "-4321")
+
+
+def test_e2e_masked_ssn_and_bare_tail(tmp_path):
+    from reportlab.pdfgen import canvas
+    c = canvas.Canvas(str(tmp_path / "masked-fake.pdf"))
+    for y, line in ((720, "*** FAKE TEST DOCUMENT - ALL VALUES FABRICATED ***"),
+                    (700, "EMPLOYEE SSN 987-65-4321"),
+                    (680, "RECIPIENT TIN XXX-XX-4321"),
+                    (660, "COPY B FOR -4321 RECORDS"),
+                    (640, "REFERENCE 90000-4321 ADJUSTMENT -4321.00")):
+        c.drawString(72, y, line)
+    c.save()
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[SWEEP:SSN]" in proc.stdout
+    out = tmp_path / "redacted"
+    pdf_text = redact.extract_pdf_text(out / "masked-fake.redacted.pdf")
+    for text in ((out / "masked-fake.txt").read_text(), pdf_text):
+        assert "EMPLOYEE SSN [SSN-1]" in text
+        assert "RECIPIENT TIN [SSN-1]" in text
+        assert "COPY B FOR [SSN-1] RECORDS" in text
+        assert "[SSN-2]" not in text
+        assert "REFERENCE 90000-4321 ADJUSTMENT -4321.00" in text
+    assert run_script(out, "--audit").returncode == 0
+
+
 def test_ein():
     out, _ = run_text("EMPLOYER EIN: 12-3456789")
     assert "12-3456789" not in out
@@ -61,6 +105,66 @@ def test_account_run_preserves_last4():
     out, _ = run_text("ACCOUNT NUMBER: 00012345678")
     assert "00012345678" not in out
     assert "[ACCT-...5678]" in out
+
+
+def test_decimals_and_percentages_are_not_accounts():
+    kept = ("0.00000123456 %", "0.00000123456%", ".00000123456 %",
+            "12.00000123456", "rate 10000000 %")
+    redacted = {
+        "ACCT 00012345678": "ACCT [ACCT-...5678]",
+        "REF 987650001 AMOUNT": "REF [ACCT-...0001] AMOUNT",
+        "Account No.12345678": "Account No.[ACCT-...5678]",
+        "No. 12345678.": "No. [ACCT-...5678].",
+        "1234567890.50": "[ACCT-...7890].50",
+    }
+    for ocr in (False, True):
+        for line in kept:
+            out = redact.redact_text(line, [], redact.TokenMap(),
+                                     defaultdict(int), ocr=ocr)
+            assert out == line, (line, ocr)
+        for line, want in redacted.items():
+            out = redact.redact_text(line, [], redact.TokenMap(),
+                                     defaultdict(int), ocr=ocr)
+            assert out == want, (line, ocr)
+
+
+def test_labeled_account_number():
+    cases = {
+        "Account No. Z12-345678": "Account No. [ACCT-...5678]",
+        "Account No. Z12-345678 Recipient ID No. XXX-XX-4321":
+            "Account No. [ACCT-...5678] Recipient ID No. [SSN-1]",
+        "ACCOUNT NUMBER: 1234-5678-90": "ACCOUNT NUMBER: [ACCT-...7890]",
+        "Acct # AB1234": "Acct # [ACCT-...1234]",
+        "AccountNo.Z12-345678": "AccountNo.[ACCT-...5678]",
+    }
+    cases.update({s: s for s in (
+        "Account Number 2025", "Account No. of shares 100", "Account No. 1,234.56",
+        "Account No. 12/31/2025 statement", "Account Summary 2025-12-31")})
+    for line, want in cases.items():
+        for ocr in (False, True):
+            out = redact.redact_text(line, [], redact.TokenMap(),
+                                     defaultdict(int), ocr=ocr)
+            assert out == want, (line, ocr)
+            assert not redact.audit_text(out, [], ocr=ocr)[0], (line, ocr)
+
+
+def test_e2e_labeled_account_is_swept_where_unlabeled(tmp_path):
+    from reportlab.pdfgen import canvas
+    c = canvas.Canvas(str(tmp_path / "acct-fake.pdf"))
+    for y, line in ((720, "*** FAKE TEST DOCUMENT - ALL VALUES FABRICATED ***"),
+                    (700, "Account No. Z12-345678"),
+                    (680, "Statement for Z12-345678 continued")):
+        c.drawString(72, y, line)
+    c.save()
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[SWEEP:ACCT]" in proc.stdout
+    out = tmp_path / "redacted"
+    pdf_text = redact.extract_pdf_text(out / "acct-fake.redacted.pdf")
+    for text in ((out / "acct-fake.txt").read_text(), pdf_text):
+        assert "Account No. [ACCT-...5678]" in text
+        assert "Statement for [ACCT-...5678] continued" in text
+        assert "345678" not in text
 
 
 def test_distinct_accounts_same_last4_get_distinct_tokens():
@@ -111,6 +215,46 @@ def test_po_box():
     assert "BOX 4321" not in out and "[ADDR-1]" in out
 
 
+def test_street_suffixes_that_are_everyday_words():
+    for line in ("4 SAMPLETECH CENTER", "4 Sampletech Center",
+                 "4 SAMPLETECH CENTER, SAMPLETOWN, CA 90000",
+                 "100 EXAMPLE PLAZA STE 200", "500 OLD COUNTRY HWY", "12 TIMES SQ"):
+        for ocr in (False, True):
+            out = redact.redact_text(line, [], redact.TokenMap(),
+                                     defaultdict(int), ocr=ocr)
+            assert out == "[ADDR-1]", (line, ocr)
+    # lower case: running text, not an address
+    for line in ("Call 800 our service center today",
+                 "Box 3 Total for the square footage",
+                 "Line 5 see the trail of payments"):
+        for ocr in (False, True):
+            out = redact.redact_text(line, [], redact.TokenMap(),
+                                     defaultdict(int), ocr=ocr)
+            assert out == line, (line, ocr)
+
+
+def test_unit_designator_apart_from_its_street():
+    cases = {
+        "SUITE 2200": "[ADDR-1]",
+        "Suite 2200": "[ADDR-1]",
+        "100 EXAMPLE STREET SUITE 2200": "[ADDR-1]",
+        "100 EXAMPLE STREET NW SUITE 2200": "[ADDR-1] NW [ADDR-2]",
+        "100 EXAMPLE ST. SUITE 2200": "[ADDR-1]. [ADDR-2]",
+        "4 SAMPLETECH CENTER, 22ND FLOOR, SUITE 2200": "[ADDR-1], [ADDR-2], [ADDR-3]",
+        "ACME WIDGETS SUITE 2200 SAMPLETOWN, CA 90000": "ACME WIDGETS [ADDR-1] [ADDR-2]",
+        "APT 4B": "[ADDR-1]", "Unit #12": "[ADDR-1]", "STE. 300": "[ADDR-1]",
+        "Rm 204": "[ADDR-1]", "APT 12-C": "[ADDR-1]", "FLOOR 5": "[ADDR-1]",
+    }
+    cases.update({s: s for s in ("sold 1 unit 5 times", "UNITS 100",
+                                 "Suite of services 2025", "ROOM AND BOARD 1200")})
+    for line, want in cases.items():
+        for ocr in (False, True):
+            out = redact.redact_text(line, [], redact.TokenMap(),
+                                     defaultdict(int), ocr=ocr)
+            assert out == want, (line, ocr)
+            assert not redact.audit_text(out, [], ocr=ocr)[0], (line, ocr)
+
+
 def test_ocr_short_suffix_needs_space():
     # ocr_rx relaxes \s+ to \s*; a 2-letter street suffix must not match the
     # tail of an ordinary word ("direCT", "intereST") on OCR-derived text
@@ -124,11 +268,285 @@ def test_ocr_short_suffix_needs_space():
         assert ocr.search(s), s
 
 
+def test_amount_before_address_is_not_part_of_it():
+    # a form row puts a box label and amount right before the street address
+    # (W-2 box 12b); only the address itself may match
+    rows = ("12bAA  9477.36  1234 EXAMPLE STREET",
+            "1 Wages 50,000.00 1234 EXAMPLE STREET, SAMPLETOWN, CA 90000")
+    for rx in (redact.ADDR, redact.ocr_rx(redact.ADDR)):
+        for s in rows:
+            matches = [m.group() for m in rx.finditer(s)]
+            assert len(matches) == 1 and matches[0].startswith("1234 EXAMPLE"), s
+    out, _ = run_text(rows[0])
+    assert out == "12bAA  9477.36  [ADDR-1]"
+
+
 def test_city_line_requires_real_state():
     out, _ = run_text("SAMPLETOWN, CA 90000")
     assert out == "[ADDR-1]"
     out, _ = run_text("SAMPLETOWN, XX 90000")  # not a state code
     assert "90000" in out
+
+
+def test_city_line_next_to_redacted_values():
+    # a city/state/zip sharing its line with nothing but redacted values
+    out, _ = run_text("1234 EXAMPLE STREET SAMPLETOWN, CA 90000")
+    assert out == "[ADDR-1] [ADDR-2]"
+    out, _ = run_text("JOHN A SAMPLE  SAMPLETOWN, CA 90000",
+                      redact.load_list(TESTDATA / "redaction_list.txt"))
+    assert "SAMPLETOWN" not in out and "[NAME-" in out and "[ADDR-1]" in out
+    # the "BOX" of a redacted PO box is not form vocabulary
+    assert run_text("PO BOX 1 SAMPLETOWN, CA 90000")[0] == "[ADDR-1] [ADDR-2]"
+    # form vocabulary still protects return-page text
+    line = "1234 EXAMPLE STREET FORM SAMPLETOWN, CA 90000"
+    assert "SAMPLETOWN, CA 90000" in run_text(line)[0]
+
+
+@pytest.mark.parametrize("font,size,leading", [
+    ("Helvetica", 8, 8), ("Helvetica", 8, 7), ("Courier", 8, 7),
+    ("Times-Roman", 6, 6), ("Helvetica", 10, 12)])
+def test_redaction_spares_lines_above_and_below(tmp_path, font, size, leading):
+    # PyMuPDF removes every glyph whose box touches a redaction; on tight
+    # line spacing that used to eat the neighbouring lines
+    from reportlab.pdfgen import canvas
+    c = canvas.Canvas(str(tmp_path / "tight-fake.pdf"))
+    c.setFont(font, size)
+    c.drawString(72, 740, "*** FAKE TEST DOCUMENT - ALL VALUES FABRICATED ***")
+    for i, line in enumerate(("FAKE BROKERAGE SERVICES", "P.O. BOX 12345",
+                              "Customer Service wording here",
+                              "SAMPLE TOWNSHIP, CA 90000-1234",
+                              "Questions and answers")):
+        c.drawString(72, 700 - i * leading, line)
+    c.save()
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    want = ["FAKE BROKERAGE SERVICES", "[ADDR-1]", "Customer Service wording here",
+            "[ADDR-2]", "Questions and answers"]
+    out = tmp_path / "redacted"
+    assert (out / "tight-fake.txt").read_text().splitlines()[-5:] == want
+    pdf_text = redact.extract_pdf_text(out / "tight-fake.redacted.pdf")
+    assert pdf_text.splitlines()[-5:] == want
+
+
+@pytest.mark.parametrize("size", [5, 6, 8, 10, 12])
+def test_words_positioned_without_space_characters(tmp_path, size):
+    # no space glyphs: each word is placed on its own, a normal word gap apart
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.pdfgen import canvas
+    c = canvas.Canvas(str(tmp_path / "nospace-fake.pdf"))
+    c.setFont("Helvetica", size)
+    y = 720
+    for line in ("FAKE TEST DOCUMENT ALL VALUES FABRICATED",
+                 "EMPLOYEE JOHN A SAMPLE", "1234 EXAMPLE STREET APT 12",
+                 "SAMPLETOWN, CA 90000", "Total dividends 1,234.56"):
+        x = 72
+        for word in line.split():
+            c.drawString(x, y, word)
+            x += stringWidth(word, "Helvetica", size) + 0.22 * size
+        y -= 1.3 * size
+    c.save()
+    (tmp_path / "redaction_list.txt").write_text("name: JOHN A SAMPLE\n")
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = tmp_path / "redacted"
+    want = ["EMPLOYEE [NAME-1]", "[ADDR-1]", "[ADDR-2]", "Total dividends 1,234.56"]
+    assert (out / "nospace-fake.txt").read_text().splitlines()[-4:] == want
+    pdf_text = redact.extract_pdf_text(out / "nospace-fake.redacted.pdf")
+    assert pdf_text.splitlines()[-4:] == want
+
+
+@pytest.mark.parametrize("mediabox", [
+    "[100 0 712 792]", "[-100 0 512 792]", "[100 80 712 872]", "[0 -80 612 712]"])
+def test_page_box_not_starting_at_origin(tmp_path, mediabox):
+    # the two libraries then disagree on coordinates; boxes used to land
+    # beside the text and the PDF self-check failed
+    import pymupdf
+    from reportlab.pdfgen import canvas
+    raw = tmp_path / "raw.tmp"
+    c = canvas.Canvas(str(raw))
+    c.setFont("Helvetica", 9)
+    for i, line in enumerate(("FAKE TEST DOCUMENT ALL VALUES FABRICATED",
+                              "Account No. Z12-345678 SSN 987-65-4321",
+                              "1234 EXAMPLE STREET", "SAMPLETOWN, CA 90000-1234",
+                              "Questions and answers 12345678")):
+        c.drawString(172, 600 - i * 14, line)
+    c.save()
+    doc = pymupdf.open(str(raw), filetype="pdf")
+    doc.xref_set_key(doc[0].xref, "MediaBox", mediabox)
+    doc.save(str(tmp_path / "mbox-fake.pdf"))
+    doc.close()
+    raw.unlink()
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "PDF SKIPPED" not in proc.stdout
+    want = ["FAKE TEST DOCUMENT ALL VALUES FABRICATED",
+            "Account No. [ACCT-...5678] SSN [SSN-1]", "[ADDR-1]", "[ADDR-2]",
+            "Questions and answers [ACCT-...5678]"]
+    out = tmp_path / "redacted"
+    assert (out / "mbox-fake.txt").read_text().splitlines()[-5:] == want
+    pdf_text = redact.extract_pdf_text(out / "mbox-fake.redacted.pdf")
+    assert pdf_text.splitlines()[-5:] == want
+
+
+@pytest.mark.parametrize("leading", [9, 10.5, 14])
+def test_degenerate_character_boxes_are_repaired(tmp_path, leading):
+    # some fonts yield character boxes of ~zero height on the descender
+    # line; nothing was removed there and the label was invisibly small
+    from reportlab.pdfgen import canvas
+    src, dst = tmp_path / "thin-fake.pdf", tmp_path / "out.pdf"
+    c = canvas.Canvas(str(src))
+    c.setFont("Helvetica", 9)
+    lines = ["FAKE TEST DOCUMENT ALL VALUES FABRICATED", "Line above stays",
+             "REF 987650001 TAXPAYER ID: ***-**-4321 END", "Line below stays"]
+    for i, line in enumerate(lines):
+        c.drawString(72, 700 - i * leading, line)
+    c.save()
+    pages = redact.extract_pdf_pages(src)
+    spans = []
+    redact.redact_text(redact.pages_to_text(pages), [], redact.TokenMap(),
+                       defaultdict(int), spans=spans)
+    rects = redact.redaction_rects(pages, spans)
+    # flatten every box onto the descender line, as those fonts report them
+    thin = {pi: [((x0, bottom + 0.4, x1, bottom + 0.401), tok)
+                 for (x0, _top, x1, bottom), tok in items]
+            for pi, items in rects.items()}
+    assert redact.write_redacted_pdf(src, dst, thin) is None
+    assert redact.extract_pdf_text(dst).splitlines() == [
+        lines[0], lines[1], "REF [ACCT-...0001] TAXPAYER ID: [SSN-1] END", lines[3]]
+
+
+def test_box_is_cleared_whole_when_the_band_misses(tmp_path, monkeypatch):
+    # glyphs whose PyMuPDF position differs from their pdfplumber box are
+    # missed by the thin band; simulate that by moving the band off the line
+    from reportlab.pdfgen import canvas
+    src, dst = tmp_path / "band-fake.pdf", tmp_path / "out.pdf"
+    c = canvas.Canvas(str(src))
+    c.drawString(72, 720, "*** FAKE TEST DOCUMENT - ALL VALUES FABRICATED ***")
+    c.drawString(72, 700, "EMPLOYEE SSN 987-65-4321 WAGES 1,000.00")
+    c.save()
+    pages = redact.extract_pdf_pages(src)
+    spans = []
+    redact.redact_text(redact.pages_to_text(pages), [], redact.TokenMap(),
+                       defaultdict(int), spans=spans)
+    rects = redact.redaction_rects(pages, spans)
+    monkeypatch.setattr(redact, "_text_band", lambda top, bottom: (top - 40, top - 39))
+    assert redact.write_redacted_pdf(src, dst, rects) is None
+    text = redact.extract_pdf_text(dst)
+    assert "987-65-4321" not in text
+    assert "EMPLOYEE SSN [SSN-1] WAGES 1,000.00" in text
+
+
+def test_small_print_columns_do_not_merge_lines(tmp_path):
+    # 4.5 pt rows 5.4 pt apart with a second column set 2.7 pt lower:
+    # pdfplumber's 3 pt line chaining merged every row into one line and
+    # interleaved the letters ("14 it h W st" was then read as a street)
+    from reportlab.pdfgen import canvas
+    c = canvas.Canvas(str(tmp_path / "cols-fake.pdf"))
+    c.setFont("Helvetica", 4.5)
+    left = ["FAKE TEST DOCUMENT", "Bay H1A, Sampletown Industrial, Estate,",
+            "Samplecity, V14 FX94, Fakeland", "Dividends 1,234.56", "Interest 78.90"]
+    right = ["ALL VALUES FABRICATED", "Payer note one", "Payer note two",
+             "Payer note three", "Payer note four"]
+    for i, (a, b) in enumerate(zip(left, right)):
+        c.drawString(72, 700 - i * 5.44, a)
+        c.drawString(300, 700 - i * 5.44 - 2.7, b)
+    c.save()
+    lines = redact.extract_pdf_text(tmp_path / "cols-fake.pdf").splitlines()
+    assert [ln for ln in lines if ln in left] == left
+    assert [ln for ln in lines if ln in right] == right
+    assert len(lines) == 10
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    txt = (tmp_path / "redacted" / "cols-fake.txt").read_text()
+    assert "Bay H1A, Sampletown Industrial, Estate," in txt
+    assert "[ADDR-" not in txt
+
+
+def test_e2e_small_print_keeps_labels_and_passes_check(tmp_path):
+    # PyMuPDF drops the label of a short redaction box; the redacted PDF then
+    # read differently from the .txt and the self-check failed on a city line
+    from reportlab.pdfgen import canvas
+    c = canvas.Canvas(str(tmp_path / "small-fake.pdf"))
+    c.setFont("Helvetica", 6)
+    for y, line in ((720, "*** FAKE TEST DOCUMENT - ALL VALUES FABRICATED ***"),
+                    (712, "RECIPIENT JOHN A SAMPLE"),
+                    (704, "1234 EXAMPLE STREET SAMPLETOWN, CA 90000"),
+                    (696, "1 A ST 5 Total dividends 1,234.56")):
+        c.drawString(72, y, line)
+    c.save()
+    (tmp_path / "redaction_list.txt").write_text("name: JOHN A SAMPLE\n")
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = tmp_path / "redacted"
+    pdf_text = redact.extract_pdf_text(out / "small-fake.redacted.pdf")
+    for text in ((out / "small-fake.txt").read_text(), pdf_text):
+        assert "RECIPIENT [NAME-1]" in text
+        assert "[ADDR-1] [ADDR-2]" in text
+        assert "[ADDR-3] 5 Total dividends 1,234.56" in text
+        for leak in ("SAMPLE", "90000", "EXAMPLE"):
+            assert leak not in text.replace("FAKE TEST DOCUMENT", "")
+    assert run_script(out, "--audit").returncode == 0
+
+
+def test_id_rule_does_not_take_zip_of_city_line():
+    for line in ("STATE ID SAMPLETOWN, CA 90000-1234",
+                 "DL SAMPLETOWN, CA 90000-1234"):
+        assert run_text(line)[0] == "[ADDR-1]", line
+    assert run_text("STATE ID: CA 123-4567-8")[0] == "STATE ID: CA [ID-1]"
+    # the late run still catches a city left alone by an earlier redaction
+    tokens, findings = redact.TokenMap(), defaultdict(int)
+    out = redact.redact_text("ACCT 12345678 SAMPLETOWN, CA 90000", [], tokens,
+                             findings, ocr=True)
+    assert out.endswith("[ADDR-1]") and "SAMPLETOWN" not in out
+
+
+def test_city_inside_a_line():
+    cases = {
+        "SAMPLETOWN, CA 90000-1234 Recipient ID No. XXX-XX-4321 "
+        "Payer's Fed ID Number 12-3456789":
+            "[ADDR-1] Recipient ID No. [SSN-1] Payer's Fed ID Number [EIN-1]",
+        "PO BOX 4321 SAMPLETOWN, CA 90000-1234 Account No. X12-345678":
+            "[ADDR-1] [ADDR-2] Account No. [ACCT-...5678]",
+        "1234 EXAMPLE STREET SAMPLETOWN, CA 90000 Recipient ID No. 987-65-4321":
+            "[ADDR-1] [ADDR-2] Recipient ID No. [SSN-1]",
+        "ACCT 12345678 SAMPLETOWN, CA 90000": "ACCT [ACCT-...5678] [ADDR-1]",
+        # ZIP+4 is redacted even on a form-vocabulary line; 5 digits is not
+        "FORM 1099 SAMPLETOWN CA 90000-1234 for 2025": "FORM 1099 [ADDR-1] for 2025",
+        # a country field between state and ZIP, two addresses on one line
+        "SAMPLETOWN CA US 90000 OTHERVILLE NY US 10000": "[ADDR-1] [ADDR-2]",
+        "SAMPLE LAKE TOWN CA US 90000-1234 OTHERVILLE NY USA 10000":
+            "[ADDR-1] [ADDR-2]",
+        "1234 EXAMPLE STREET SAMPLETOWN CA US 90000 500 INDUSTRY WAY "
+        "OTHERVILLE NY US 10000": "[ADDR-1] [ADDR-3] [ADDR-2] [ADDR-4]",
+        "Shipped to CA US 90000 units": "Shipped to CA US 90000 units",
+        "Paid In US 10000.00": "Paid In US 10000.00",
+        # a street-name word is never a bare number
+        "123 5TH AVE": "[ADDR-1]",
+        "100 200 MAIN ST": "100 [ADDR-1]",
+        # comma with no space after it
+        "SAMPLE LAKE TOWN,CA 90000-1234": "[ADDR-1]",
+        "SAMPLE LAKE TOWN,CA 90000": "[ADDR-1]",
+        "SAMPLETOWN,CA 90000-1234 Recipient ID No. 987-65-4321":
+            "[ADDR-1] Recipient ID No. [SSN-1]",
+        "SAMPLETOWN,CA 90000 Recipient ID No. 987-65-4321":
+            "[ADDR-1] Recipient ID No. [SSN-1]",
+        "P.O. BOX 12345,SAMPLETOWN,CA 90000-1234": "[ADDR-1]",
+        "wages,IN 10000 and tips": "wages,IN 10000 and tips",
+        "Proceeds,OR 12345.00": "Proceeds,OR 12345.00",
+        # unchanged
+        "FORM 1099 for SAMPLETOWN, CA 90000 filers":
+            "FORM 1099 for SAMPLETOWN, CA 90000 filers",
+        "STATE ID: CA 123-4567-8": "STATE ID: CA [ID-1]",
+        "12bAA  9477.36  1234 EXAMPLE STREET": "12bAA  9477.36  [ADDR-1]",
+        "wages, IN 10000 and tips": "wages, IN 10000 and tips",
+        "Total proceeds, OR 12345.00": "Total proceeds, OR 12345.00",
+    }
+    for line, want in cases.items():
+        for ocr in (False, True):
+            out = redact.redact_text(line, [], redact.TokenMap(),
+                                     defaultdict(int), ocr=ocr)
+            assert out == want, (line, ocr)
+            assert not redact.audit_text(out, [], ocr=ocr)[0], (line, ocr)
 
 
 def test_city_edge_ocr_rule():
@@ -149,9 +567,10 @@ def test_city_edge_ocr_rule():
     for s in ("TOTAL DIVIDENDS 12345", "PAY BY 10000", "BOX 1 WAGES 120450",
               "SEE SCHEDULE CA 12345", "PAGE 1 OF 3  SAMPLETOWN, CA 90000"):
         assert ocr(s) == s, s  # the last: form vocabulary on the line wins
-    # text-layer extracts do not get the edge rule; whole-line rule still does
-    plain, _ = run_text(merged)
-    assert plain == merged
+    # text-layer extracts do not get the edge rule: a comma-less city merged
+    # into other wording is left to the sweep; the whole-line rule still fires
+    plain_merged = "IMPORTANT TAX RETURN DOCUMENT ENCLOSED  SAMPLETOWN CA 90000"
+    assert run_text(plain_merged)[0] == plain_merged
     assert run_text("SAMPLETOWN, CA 90000")[0] == "[ADDR-1]"
 
 
@@ -202,12 +621,204 @@ def test_name_variants_share_one_token():
     assert out.count("[NAME-1]") == 2  # both variants -> the canonical's token
 
 
+def test_first_and_last_name_apart_on_one_line():
+    entries = redact.load_list(TESTDATA / "redaction_list.txt")
+
+    def red(text):
+        out, _ = run_text(text, entries)
+        assert not redact.audit_text(out, entries)[0], text
+        return out
+    assert (red("First name JOHN Middle initial A Last name SAMPLE")
+            == "First name [NAME-1] Middle initial A Last name [NAME-1]")
+    assert (red("First name John A. Last name Sample Suffix")
+            == "First name [NAME-1] Last name [NAME-1] Suffix")
+    assert red("Last SAMPLE First JOHN") == "Last [NAME-1] First [NAME-1]"
+    # a shared last name: both first names go, each under its own token
+    # (JANE SAMPLE matches as a full name first, so it takes the first token)
+    assert red("JOHN & JANE SAMPLE") == "[NAME-2] & [NAME-1]"
+    assert (red("First JOHN Spouse JANE Last SAMPLE")
+            == "First [NAME-1] Spouse [NAME-2] Last [NAME-1]")
+    # one part alone is left: many names are ordinary words
+    for line in ("JOHN called on Monday", "SAMPLE of the product"):
+        assert red(line) == line
+
+
 def test_list_matching_case_and_whitespace_insensitive():
     entries = redact.load_list(TESTDATA / "redaction_list.txt")
     out, f = run_text("employee: John  A  Sample of ACME WIDGETS INC", entries)
     assert "Sample" not in out and "ACME" not in out
     assert "[NAME-1]" in out and "[EMPLOYER-1]" in out
     assert any(reason == "[LIST:name]" for reason, _, _ in f)
+
+
+def test_unknown_list_prefix_is_redacted_as_name_and_reported(tmp_path):
+    lst = tmp_path / "redaction_list.txt"
+    lst.write_text("# comment\ntrust: SAMPLE FAMILY TRUST\nname: JOHN A SAMPLE\n")
+    entries = redact.load_list(lst)
+    assert ("name", "SAMPLE FAMILY TRUST") in {(e[0], e[1]) for e in entries}
+    # reported by line number only
+    assert redact.list_unknown_prefixes(lst) == [2]
+    from reportlab.pdfgen import canvas
+    c = canvas.Canvas(str(tmp_path / "trust-fake.pdf"))
+    c.drawString(72, 720, "*** FAKE TEST DOCUMENT - ALL VALUES FABRICATED ***")
+    c.drawString(72, 700, "ACCOUNT OWNER SAMPLE FAMILY TRUST")
+    c.save()
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    line = next(l for l in proc.stdout.splitlines() if "UNKNOWN LIST PREFIX" in l)
+    assert "redaction list line(s) 2" in line and "trust" not in line.lower()
+    assert "ACCOUNT OWNER [NAME-" in (tmp_path / "redacted" / "trust-fake.txt").read_text()
+
+
+def test_ssn_list_entry(tmp_path):
+    lst = tmp_path / "redaction_list.txt"
+    lst.write_text("social: 987-65-4321\nssn: 123 45 6789\n")
+    entries = redact.load_list(lst)
+    assert {e[0] for e in entries} == {"ssn"}
+    assert redact.list_unknown_prefixes(lst) == []
+    # any grouping, including bare digits on an unlabeled line
+    out, _ = run_text("REF 987654321 and 987 65 4321 and 123-45-6789", entries)
+    assert out == "REF [SSN-1] and [SSN-1] and [SSN-2]"
+    # only masked forms in the documents: tail and mask share the listed token
+    from reportlab.pdfgen import canvas
+    c = canvas.Canvas(str(tmp_path / "masked-fake.pdf"))
+    for y, text in ((720, "*** FAKE TEST DOCUMENT - ALL VALUES FABRICATED ***"),
+                    (700, "RECIPIENT TIN XXX-XX-4321"),
+                    (680, "COPY B FOR -4321 RECORDS"),
+                    (660, "OTHER TIN XXX-XX-9999")):
+        c.drawString(72, y, text)
+    c.save()
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    txt = (tmp_path / "redacted" / "masked-fake.txt").read_text()
+    assert "RECIPIENT TIN [SSN-1]" in txt and "COPY B FOR [SSN-1] RECORDS" in txt
+    assert "OTHER TIN [SSN-2]" in txt
+
+
+def test_address_list_entry_ignores_punctuation_and_spacing(tmp_path):
+    lst = tmp_path / "redaction_list.txt"
+    lst.write_text("address: 77 QUIET HOLLOW, SAMPLETOWN, CA 90000\n")
+    entries = redact.load_list(lst)
+    assert {e[0] for e in entries} == {"addr"}
+    assert redact.list_unknown_prefixes(lst) == []
+    for line in ("77 QUIET HOLLOW, SAMPLETOWN, CA 90000",
+                 "77 QUIET HOLLOW     SAMPLETOWN     CA 90000",
+                 "77 Quiet Hollow,Sampletown,CA 90000"):
+        assert run_text(f"MAIL {line} END", entries)[0] == "MAIL [ADDR-1] END", line
+
+
+def test_address_list_entry_matches_either_suffix_spelling(tmp_path):
+    # the list says DRIVE, the form says DR (or DR., or OCR-glued): same address
+    lst = tmp_path / "redaction_list.txt"
+    lst.write_text("addr: 500 INDUSTRY DRIVE, SAMPLETOWN, CA 90001\n")
+    entries = redact.load_list(lst)
+    for line in ("500 INDUSTRY DRIVE, SAMPLETOWN, CA 90001",
+                 "500 INDUSTRY DR, SAMPLETOWN, CA 90001",
+                 "500 Industry Dr. Sampletown CA 90001"):
+        assert run_text(f"MAIL {line} END", entries)[0] == "MAIL [ADDR-1] END", line
+    glued = redact.redact_text("500INDUSTRYDR,SAMPLETOWN,CA90001", entries,
+                               redact.TokenMap(), defaultdict(int), ocr=True)
+    assert glued == "[ADDR-1]"
+    # a different house number, and a word that merely starts with the
+    # suffix, are not the listed street (the generic ADDR pattern may still
+    # box the line, but not on the list entry's account)
+    for line in ("501 INDUSTRY DR", "500 INDUSTRY DRIVER"):
+        _out, findings = run_text(line, entries)
+        assert not any(reason.startswith("[LIST:") for reason, _o, _t in findings), line
+    # reverse direction, directionals and unit words
+    lst.write_text("addr: 12 N MAIN ST APT 4\n")
+    entries = redact.load_list(lst)
+    for line in ("12 N MAIN ST APT 4", "12 NORTH MAIN STREET APARTMENT 4",
+                 "12 N. Main St., Apt. 4"):
+        assert run_text(f"AT {line} END", entries)[0] == "AT [ADDR-1] END", line
+
+
+def test_address_list_entry_matches_split_lines(tmp_path):
+    # forms print the street on one line and city/state/ZIP on the next; an
+    # OCR row may glue the street to unrelated fragments. Both halves of a
+    # full entry match on their own, under the entry's one token.
+    lst = tmp_path / "redaction_list.txt"
+    for entry in ("addr: 500 INDUSTRY DRIVE, SAMPLETOWN, CA 90001",
+                  "addr: 500 INDUSTRY DRIVE SAMPLETOWN CA 90001"):
+        lst.write_text(entry + "\n")
+        entries = redact.load_list(lst)
+        tokens = redact.TokenMap()
+        text = ("[ACCT-...5678]-XX00  500INDUSTRYDR  Return file date:  10/7/2026\n"
+                "SAMPLETOWN,CA90001\n"
+                "500 INDUSTRY DRIVE, SAMPLETOWN, CA 90001")
+        out = redact.redact_text(text, entries, tokens, defaultdict(int), ocr=True)
+        assert out.splitlines() == [
+            "[ACCT-...5678]-XX00  [ADDR-1]  Return file date:  10/7/2026",
+            "[ADDR-1]", "[ADDR-1]"], entry
+    # a unit after the street stays with the street half
+    assert list(redact._addr_variants("123 MAIN DR, APT 4, SAMPLETOWN, CA 90000")) == [
+        "123 MAIN DR, APT 4, SAMPLETOWN, CA 90000", "123 MAIN DR, APT 4", "SAMPLETOWN, CA 90000"]
+    assert list(redact._addr_variants("123 MAIN DR APT 4 SAMPLETOWN CA 90000")) == [
+        "123 MAIN DR APT 4 SAMPLETOWN CA 90000", "123 MAIN DR APT 4", "SAMPLETOWN CA 90000"]
+    lst.write_text("addr: 123 MAIN DR, APT 4, SAMPLETOWN, CA 90000\n")
+    entries = redact.load_list(lst)
+    tokens = redact.TokenMap()
+    out = redact.redact_text("AT 123 Main Dr Apt 4\nIN Sampletown CA 90000", entries,
+                             tokens, defaultdict(int))
+    assert out == "AT [ADDR-1]\nIN [ADDR-1]"
+    # no comma and no recognisable suffix, or a street-only entry: no split
+    assert list(redact._addr_variants("77 QUIET HOLLOW SAMPLETOWN CA 90000")) == [
+        "77 QUIET HOLLOW SAMPLETOWN CA 90000"]
+    assert list(redact._addr_variants("500 INDUSTRY DRIVE")) == ["500 INDUSTRY DRIVE"]
+    assert list(redact._addr_variants("500 INDUSTRY DRIVE, SAMPLETOWN")) == [
+        "500 INDUSTRY DRIVE, SAMPLETOWN"]
+
+
+def test_address_filed_as_a_name_is_not_split(tmp_path):
+    # the first-and-last-name rule must not treat a street number and a ZIP
+    # as someone's first and last name
+    lst = tmp_path / "redaction_list.txt"
+    lst.write_text("name: 77 QUIET HOLLOW, SAMPLETOWN, CA 90000\n"
+                   "home: 78 QUIET HOLLOW, SAMPLETOWN, CA 90001\n")
+    entries = redact.load_list(lst)
+    for line in ("77 QUIET HOLLOW     SAMPLETOWN     CA 90000",
+                 "78 QUIET HOLLOW     SAMPLETOWN     CA 90001"):
+        out, _ = run_text(line, entries)
+        assert "[NAME-" not in out, line
+
+
+def test_email_list_entry(tmp_path):
+    lst = tmp_path / "redaction_list.txt"
+    lst.write_text("email: john.sample@example.com\n")
+    entries = redact.load_list(lst)
+    assert redact.list_unknown_prefixes(lst) == []
+    # listed and pattern-found addresses use the same EMAIL tokens
+    out, _ = run_text("CONTACT John.Sample@Example.com OR jane@example.org", entries)
+    assert out == "CONTACT [EMAIL-1] OR [EMAIL-2]"
+    assert run_text("CONTACT john.sample@example.com")[0] == "CONTACT [EMAIL-1]"
+
+
+def test_dob_id_phone_list_entries(tmp_path):
+    lst = tmp_path / "redaction_list.txt"
+    lst.write_text("dob: 01/02/1980\nid: D1234567\nphone: (555) 010-0199\n"
+                   "dob: September 30, 1975\nphone: 555-0142\n")
+    entries = redact.load_list(lst)
+    assert redact.list_unknown_prefixes(lst) == []
+
+    def red(text):
+        return run_text(text, entries)[0]
+    # no DOB / license label on any of these lines
+    for form in ("01/02/1980", "1/2/1980", "1-2-80", "01.02.1980", "1980-01-02",
+                 "January 2, 1980", "JAN 2 1980", "Jan. 2nd, 1980", "2 January 1980"):
+        assert red(f"SEEN {form} HERE") == "SEEN [DOB-1] HERE", form
+    for form in ("9/30/1975", "Sept 30, 1975", "1975-09-30"):
+        assert red(f"SEEN {form} HERE") == "SEEN [DOB-1] HERE", form
+    for other in ("01/02/1981", "11/02/1980", "01/02/19801", "2/1/1980",
+                  "January 12, 1980", "PAID 1/2/8012"):
+        assert red(f"SEEN {other} HERE") == f"SEEN {other} HERE", other
+    assert red("REF D1234567 X") == "REF [ID-1] X"
+    assert red("REF D12345678 X") == "REF D[ACCT-...5678] X"   # not the listed ID
+    for form in ("(555) 010-0199", "555-010-0199", "555.010.0199", "5550100199",
+                 "1-555-010-0199", "+1 555 010 0199"):
+        assert red(f"CALL {form} NOW") == "CALL [PHONE-1] NOW", form
+    assert red("CALL 555-0142 NOW") == "CALL [PHONE-1] NOW"
+    assert red("CALL 555 0142 NOW") == "CALL [PHONE-1] NOW"
+    assert red("TOTAL 15550142 NOW") != "TOTAL [PHONE-1] NOW"
 
 
 def test_load_list_categories_and_comments(tmp_path):
@@ -491,24 +1102,27 @@ def test_e2e_pdf_written_and_clean(workdir):
 
 
 def test_sweep_catches_pattern_value_in_other_context(workdir):
-    # A text-layer PDF: the city/state/zip once on its own line (found by the
-    # whole-line rule) and once merged into other wording (found by nothing
-    # but the sweep, since --no-ocr keeps the OCR edge rule out of play).
+    # A text-layer PDF: a city/state/zip that is in no list entry (a listed
+    # address's city line would be matched by the entry's locality half),
+    # once on its own line (found by the whole-line rule) and once merged
+    # into other wording (found by nothing but the sweep: --no-ocr keeps the
+    # OCR edge rule out of play, and with no comma and a 5-digit ZIP the
+    # in-line city rule does not apply).
     from reportlab.pdfgen import canvas
     c = canvas.Canvas(str(workdir / "envelope-fake.pdf"))
     c.drawString(72, 720, "*** FAKE TEST DOCUMENT - ALL VALUES FABRICATED ***")
-    c.drawString(72, 700, "SAMPLETOWN, CA 90000")
-    c.drawString(72, 680, "IMPORTANT TAX RETURN DOCUMENT ENCLOSED SAMPLETOWN, CA 90000")
+    c.drawString(72, 700, "OTHERTOWN CA 90002")
+    c.drawString(72, 680, "IMPORTANT TAX RETURN DOCUMENT ENCLOSED OTHERTOWN CA 90002")
     c.save()
     proc = run_script(workdir, "--yes", "--no-ocr")
     assert proc.returncode == 0, proc.stderr
     assert "[SWEEP:ADDR]" in proc.stdout
     out = workdir / "redacted"
     txt = (out / "envelope-fake.txt").read_text()
-    assert "SAMPLETOWN" not in txt and "90000" not in txt
+    assert "OTHERTOWN" not in txt and "90002" not in txt
     assert "IMPORTANT TAX RETURN DOCUMENT ENCLOSED [ADDR-" in txt
     pdf_text = redact.extract_pdf_text(out / "envelope-fake.redacted.pdf")
-    assert "SAMPLETOWN" not in pdf_text and "90000" not in pdf_text
+    assert "OTHERTOWN" not in pdf_text and "90002" not in pdf_text
 
 
 def test_e2e_no_pdf_flag(workdir):
@@ -586,6 +1200,85 @@ def test_plain_pdf_is_not_flattened(workdir):
     assert redact.flatten_pdf(workdir / "w2-fake.pdf") is None
     proc = run_script(workdir, "--preview", "--no-ocr")
     assert "FLATTENED" not in proc.stdout
+
+
+def _rotated_pdf(path, rotation):
+    """A page stored sideways and shown upright via /Rotate, as scanners and
+    payroll exports produce."""
+    import pymupdf
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.set_rotation(rotation)
+    for y, line in ((72, "EMPLOYEE JOHN A SAMPLE SSN 987-65-4321 WAGES 1,000.00"),
+                    (100, "12bAA  9477.36  1234 EXAMPLE STREET")):
+        page.insert_text(pymupdf.Point(72, y) * page.derotation_matrix, line,
+                         rotate=rotation)
+    doc.save(str(path))
+    doc.close()
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_rotated_pages_are_unrotated_and_redacted(tmp_path, rotation):
+    import pymupdf
+    src = tmp_path / "rotated-fake.pdf"
+    _rotated_pdf(src, rotation)
+    (tmp_path / "redaction_list.txt").write_text("name: JOHN A SAMPLE\n")
+    before = src.read_bytes()
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "ROTATION REMOVED: rotated-fake.pdf had 1 rotated page(s)" in proc.stdout
+    assert "PDF SKIPPED" not in proc.stdout
+    out = tmp_path / "redacted"
+    pdf_text = redact.extract_pdf_text(out / "rotated-fake.redacted.pdf")
+    for text in ((out / "rotated-fake.txt").read_text(), pdf_text):
+        assert "[NAME-1]" in text and "[SSN-" in text and "[ADDR-" in text
+        assert "WAGES 1,000.00" in text and "9477.36" in text
+        for leak in ("SAMPLE", "987-65-4321", "EXAMPLE STREET"):
+            assert leak not in text
+    doc = pymupdf.open(str(out / "rotated-fake.redacted.pdf"))
+    assert doc[0].rotation == 0
+    # same visible page size as the rotated source
+    assert tuple(doc[0].rect) == tuple(pymupdf.open(str(src))[0].rect)
+    doc.close()
+    # source untouched, and no unrotated copy left anywhere
+    assert src.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "redacted", "redaction_list.txt", "rotated-fake.pdf"]
+    assert run_script(out, "--audit").returncode == 0
+
+
+@pytest.mark.parametrize("noise", [
+    b"-0.00001 1 -1 0.00001 0 0 cm", b"0.00001 1 -1 -0.00001 0 0 cm"])
+def test_rotation_noise_does_not_make_text_sideways(tmp_path, noise):
+    # a rotation written with +/-1e-5 instead of 0 made pdfminer flag every
+    # character as sideways; the lines came out as interleaved letters
+    import pymupdf
+    lines = ["FAKE TEST DOCUMENT ALL VALUES FABRICATED",
+             "Bay H1A, Sampletown Industrial, Estate,",
+             "Samplecity, V14 FX94, Fakeland", "EMPLOYEE SSN 987-65-4321"]
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.set_rotation(90)
+    for i, text in enumerate(lines):
+        page.insert_text(pymupdf.Point(72, 72 + 13 * i) * page.derotation_matrix,
+                         text, rotate=90, fontsize=11)
+    for xref in page.get_contents():
+        stream = doc.xref_stream(xref)
+        assert b"0 1 -1 0 0 0 cm" in stream
+        doc.update_stream(xref, stream.replace(b"0 1 -1 0 0 0 cm", noise))
+    doc.save(str(tmp_path / "noise-fake.pdf"))
+    doc.close()
+    proc = run_script(tmp_path, "--yes", "--no-ocr")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    want = lines[:3] + ["EMPLOYEE SSN [SSN-1]"]
+    out = tmp_path / "redacted"
+    assert (out / "noise-fake.txt").read_text().splitlines()[-4:] == want
+    pdf_text = redact.extract_pdf_text(out / "noise-fake.redacted.pdf")
+    assert pdf_text.splitlines()[-4:] == want
+
+
+def test_unrotate_leaves_plain_pdf_alone(workdir):
+    assert redact.unrotate_pdf(workdir / "w2-fake.pdf") is None
 
 
 def test_unflattened_count():
@@ -865,6 +1558,26 @@ def test_existing_list_is_appended_and_idempotent(workdir):
     assert proc2.returncode == 0, proc2.stderr
     assert "new entr" not in proc2.stdout
     assert lst.read_text() == text
+
+
+def test_form_wording_is_not_suggested():
+    text = "\n".join([
+        "COPY B FOR RECIPIENT",
+        "INSTRUCTIONS FOR RECIPIENTS OF FORM 1099",
+        "RECIPIENT: KEEP FOR YOUR RECORDS",
+        "THIS IS YOUR FORM RECIPIENT",
+        "IRS FATCA FILING REQUIREMENT RECIPIENT",
+        "DEPARTMENT OF THE TREASURY RECIPIENT COPY",
+        "SALE ELECTION UNDER SECTION 754 PER TREAS REG 1.754 PARTNER NAME",
+        "PTE FEIN 12-3456789 TAXPAYER COPY",
+        "TOTAL WAGES ACME HOLDINGS GROUP PAID TO EMPLOYEE",
+        "RECIPIENT NAME: JOHN A SAMPLE",
+        "PAYER: FIRST FEDERAL CREDIT UNION",
+        "PAYER: BANK OF EXAMPLE",
+    ])
+    assert redact.suggest_entries({"x.pdf": text}, []) == [
+        "name: JOHN A SAMPLE", "employer: FIRST FEDERAL CREDIT UNION",
+        "employer: BANK OF EXAMPLE"]
 
 
 def test_commented_out_entry_is_not_readded(workdir):
@@ -1186,3 +1899,45 @@ def test_inspect_reports_esigned_and_certificate(tmp_path):
     for leak in ("esigned-fake", "SAMPLE", "1A2B3C4D", "10.0.0.1", "WITNESS",
                  "unreadable", "Completion"):
         assert leak not in proc.stdout
+
+
+def _image_only_pdf(path, n_pages):
+    """A PDF of n_pages blank white photos and no text layer, like a phone scan."""
+    from PIL import Image
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+    c = canvas.Canvas(str(path), pagesize=letter)
+    for _ in range(n_pages):
+        c.drawImage(ImageReader(Image.new("RGB", (850, 1100), "white")),
+                    0, 0, width=letter[0], height=letter[1])
+        c.showPage()
+    c.save()
+
+
+def test_page_text_chars_ignores_page_separators():
+    five_blank_pages = [[("", [])] for _ in range(5)]
+    assert len(redact.pages_to_text(five_blank_pages).strip()) >= redact.MIN_TEXT_CHARS
+    assert redact.page_text_chars(five_blank_pages) == 0
+    assert redact.page_text_chars([[("abc", [None] * 3), ("  d ", [None] * 4)]]) == 4
+
+
+def test_multipage_scan_is_detected_as_needing_ocr(tmp_path):
+    # Regression: a 5-page image-only PDF (phone scan) used to pass the
+    # text-layer check on the strength of its PAGE_SEP lines alone, so OCR
+    # never ran and nothing was redacted.
+    _image_only_pdf(tmp_path / "phone-scan.pdf", 5)
+    shutil.copy(TESTDATA / "redaction_list.txt", tmp_path)
+    proc = run_script(tmp_path, "--preview", "--no-ocr")
+    assert proc.returncode == 0, proc.stderr
+    assert "NEEDS OCR" in proc.stdout
+    assert "0 planned redaction" in proc.stdout
+
+
+def test_ocr_render_scale_is_capped_for_oversized_pages():
+    assert redact._ocr_scale(612, 792) == pytest.approx(300 / 72)
+    # a phone scan stored at its pixel size renders no larger than a letter
+    # page at 300 DPI
+    scale = redact._ocr_scale(1993, 2562)
+    assert 2562 * scale == pytest.approx(redact._OCR_MAX_SIDE)
+    assert scale < 300 / 72

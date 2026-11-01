@@ -139,14 +139,21 @@ spot-check.
   `--yes` skips the prompt for scripted runs; `--report PATH` also writes the
   report to a file.
 - **Pattern rules.** SSNs (separated, spaced, and bare 9-digit on
-  SSN/TIN/EIN-labeled lines), EINs, email addresses, phone numbers, account
-  numbers (digit runs of 8+, last 4 preserved), dates of birth (on
+  SSN/TIN/EIN-labeled lines; masked forms such as `XXX-XX-4321`; and the
+  bare tail `-4321` of any SSN seen in the run, all under the same token as
+  the full number), EINs, email addresses, phone numbers, account
+  numbers (digit runs of 8+, and any number following an `Account No.` /
+  `Acct #` style label, such as `Z12-345678`; last 4 preserved), dates of birth (on
   DOB-labeled lines only, so transaction dates survive), driver's license /
   state ID numbers (on license-labeled lines), bank routing numbers (on
   routing/ABA-labeled lines), and addresses: street lines with optional
-  APT/UNIT/STE suffixes, PO Boxes, and standalone city/state/ZIP lines
+  APT/UNIT/STE suffixes, unit designators standing apart from their street
+  (`SUITE 2200`, `Apt 4B`, `22ND FLOOR`), PO Boxes, standalone city/state/ZIP lines
   (whole-line match, real state codes only, never on lines carrying form
-  vocabulary such as SCHEDULE or LINE). Dollar amounts, other dates, and
+  vocabulary such as SCHEDULE or LINE), and a city/state/ZIP inside a line
+  (`City, ST 12345`, with a ZIP+4, or with a country field as in
+  `City ST US 12345`; a capitalised word or two before the
+  city may be redacted with it). Dollar amounts, other dates, and
   box/line numbers are untouched.
 - **Signature blocks.** A DocuSign-style stamp — the `DocuSigned by:`
   label, the signature itself, and the signer ID line under it — is boxed as
@@ -187,11 +194,22 @@ spot-check.
 - **Redaction list.** Names, employers, addresses, and account numbers are
   not reliably pattern-detectable, so they come from a user-maintained
   `redaction_list.txt`: one entry per line, optional `name:` / `addr:` /
-  `acct:` / `employer:` prefix (default `name`), `#` comments, matched
+  `acct:` / `employer:` / `ssn:` / `email:` / `dob:` / `id:` / `phone:`
+  prefix (default `name`; `social:`, `address:`
+  and `account:` are accepted for `ssn:`, `addr:` and `acct:`; an `addr:`
+  entry matches whatever the commas and spacing on the page, and either
+  spelling of a street suffix, directional or unit word (`DRIVE`/`DR`,
+  `STREET`/`ST`, `NORTH`/`N`, `APARTMENT`/`APT`, …), with or without a
+  period; a full entry (`street, city, ST ZIP`) also matches its street line
+  and its city/state/ZIP line separately, as forms print them, under the
+  same token; any other one-word prefix draws a warning and its
+  value is redacted as a name), `#` comments, matched
   case-insensitively with collapsed whitespace, longest entry first. A
   `name:` entry like `JOHN A SAMPLE` also matches `JOHN SAMPLE`,
   `SAMPLE, JOHN A` and `SAMPLE, JOHN`, all mapping to the same `[NAME-n]`
-  token. Every run scans name-labeled lines for candidate entries and appends
+  token. When the first and last name both appear on one line with other
+  text between them (separate form fields, `JOHN & JANE SAMPLE`), both are
+  redacted too; a first or last name alone on a line is not. Every run scans name-labeled lines for candidate entries and appends
   new ones under a dated `# auto-added` header; a commented-out entry is
   never redacted and never re-added. Entries that never matched are flagged
   in the preview summary.
@@ -224,8 +242,10 @@ spot-check.
   people and programs; a scanned PDF gets its redacted OCR text written back
   as an invisible layer so it stays searchable. Every PDF is then re-extracted
   and audited with the same rules; a residual match deletes the PDF and fails
-  the run. PDFs with rotated or cropped pages are skipped with a
-  `PDF SKIPPED` warning — print them to PDF first.
+  the run. Rotated pages are rewritten in memory as unrotated pages
+  that look the same (a `ROTATION REMOVED` note; the source file is not
+  modified). PDFs with cropped pages are skipped with a `PDF SKIPPED`
+  warning — print them to PDF first.
 - **Fillable forms and annotations (flattened by default).** Values typed
   into form fields, and annotation text, are stored apart from the page text
   and would otherwise be invisible to extraction. They are merged into the
